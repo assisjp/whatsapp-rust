@@ -9,6 +9,7 @@ use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
 use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
+use waproto::whatsapp as wa;
 
 use crate::client::Client;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};

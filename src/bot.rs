@@ -1329,9 +1329,9 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
-    pub fn with_history_sync_durability_hook<H>(mut self, hook: H) -> Self
+    pub fn with_history_sync_durability_hook<Hook>(mut self, hook: Hook) -> Self
     where
-        H: HistorySyncDurabilityHook + 'static,
+        Hook: HistorySyncDurabilityHook + 'static,
     {
         self.history_sync_durability_hook = Some(Arc::new(hook));
         self
