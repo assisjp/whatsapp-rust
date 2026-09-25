@@ -1074,7 +1074,7 @@ mod tests {
             metadata: &HistorySyncMetadata<'_>,
             compressed: &[u8],
         ) -> anyhow::Result<()> {
-            assert_eq!(key.sender, "5511000000001:0@s.whatsapp.net");
+            assert_eq!(key.sender, "5511000000001@s.whatsapp.net");
             assert_eq!(metadata.file_length, Some(42));
             if self.expect_invalid_chunk.load(Ordering::SeqCst) {
                 assert_eq!(compressed, &[1, 2, 3]);
