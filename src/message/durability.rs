@@ -38,6 +38,9 @@ impl Client {
     /// counting suppressions must not count that one. A replay whose commit
     /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
+        if let Some(committed) = self.replay_pending_history_sync(info).await {
+            return committed;
+        }
         if self.inbound_durability_hook().is_some() {
             let backend = self.persistence_manager.backend();
             let chat = info.source.chat.to_string();

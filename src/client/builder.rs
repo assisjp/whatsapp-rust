@@ -22,6 +22,7 @@ use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::history_sync_admission::HistorySyncAdmission;
+use crate::types::history_sync_durability::HistorySyncDurabilityHook;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
@@ -123,6 +124,7 @@ pub struct ClientBuilder {
     cache_config: CacheConfig,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
@@ -164,6 +166,7 @@ impl ClientBuilder {
             cache_config: CacheConfig::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_durability_hook: None,
             history_sync_admission: None,
             skip_history_sync: false,
             ab_props_fetch: true,
@@ -314,6 +317,23 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Persist both forms of history sync before acknowledging the notification.
+    pub fn with_history_sync_durability_hook<H>(mut self, hook: H) -> Self
+    where
+        H: HistorySyncDurabilityHook + 'static,
+    {
+        self.history_sync_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    pub fn with_history_sync_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncDurabilityHook>,
+    ) -> Self {
+        self.history_sync_durability_hook = Some(hook);
         self
     }
 
@@ -533,7 +553,8 @@ impl ClientBuilder {
                 return Err(ClientBuilderError::InvalidPluginTaskDrainTimeout);
             }
 
-            if self.inbound_durability_hook.is_some() {
+            if self.inbound_durability_hook.is_some() || self.history_sync_durability_hook.is_some()
+            {
                 probe_durability_backend(&persistence_manager.backend()).await?;
             }
 
@@ -656,6 +677,9 @@ impl ClientBuilder {
         }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
+        }
+        if let Some(hook) = self.history_sync_durability_hook {
+            let _ = client.history_sync_durability_hook.set(hook);
         }
         if self.skip_history_sync {
             client.set_skip_history_sync(true);

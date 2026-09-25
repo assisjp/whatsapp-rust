@@ -182,6 +182,7 @@ pub(crate) struct SessionBatchOutcome {
     skdm_only: bool,
     plaintext_failed: bool,
     had_failure: bool,
+    history_sync_deferred: bool,
 }
 
 /// Outcome of a PN→LID migration retry decrypt. On `Decrypted` the plaintext
@@ -209,6 +210,7 @@ enum MigrationDecryptResult {
 pub(crate) struct PlaintextHandleOutcome {
     dispatched: bool,
     skdm_only: bool,
+    history_sync_deferred: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

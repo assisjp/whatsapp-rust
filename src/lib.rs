@@ -238,6 +238,7 @@ pub use types::durability_hook::InboundDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
+pub use types::history_sync_durability::{HistorySyncDurabilityHook, HistorySyncKey};
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
 pub mod error;

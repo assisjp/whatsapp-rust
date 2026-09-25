@@ -1924,6 +1924,9 @@ pub struct Client {
     /// at-most-once behavior with zero overhead.
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
+    pub(crate) history_sync_durability_hook: std::sync::OnceLock<
+        Arc<dyn crate::types::history_sync_durability::HistorySyncDurabilityHook>,
+    >,
 
     /// Optional retry-receipt admission policy (see
     /// [`crate::types::retry_admission::RetryAdmission`]): an operator opt-in to

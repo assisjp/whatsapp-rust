@@ -12,6 +12,7 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::history_sync_admission::HistorySyncAdmission;
+use crate::types::history_sync_durability::HistorySyncDurabilityHook;
 use crate::types::message::MessageInfo;
 use futures::FutureExt;
 use log::{info, warn};
@@ -715,6 +716,7 @@ pub struct BotBuilder<
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
@@ -748,6 +750,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_durability_hook: None,
             history_sync_admission: None,
             override_version: None,
             device_props_override: None,
@@ -785,6 +788,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
             inbound_durability_hook: self.inbound_durability_hook,
+            history_sync_durability_hook: self.history_sync_durability_hook,
             history_sync_admission: self.history_sync_admission,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
@@ -1325,6 +1329,22 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    pub fn with_history_sync_durability_hook<H>(mut self, hook: H) -> Self
+    where
+        H: HistorySyncDurabilityHook + 'static,
+    {
+        self.history_sync_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    pub fn with_history_sync_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncDurabilityHook>,
+    ) -> Self {
+        self.history_sync_durability_hook = Some(hook);
+        self
+    }
+
     /// Override the WhatsApp version used by the client.
     ///
     /// By default, the client will automatically fetch the latest version from WhatsApp's servers.
@@ -1601,6 +1621,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
         if let Some(hook) = self.inbound_durability_hook {
             client_builder = client_builder.with_inbound_durability_hook_arc(hook);
+        }
+        if let Some(hook) = self.history_sync_durability_hook {
+            client_builder = client_builder.with_history_sync_durability_hook_arc(hook);
         }
         if let Some(admission) = self.history_sync_admission {
             client_builder = client_builder.with_history_sync_admission_arc(admission);

@@ -38,6 +38,34 @@ fn push_enc_payload(bucket: &mut Vec<EncPayload>, stanza_enc_count: usize, paylo
     bucket.push(payload);
 }
 
+/// Inspect every self plaintext before any sibling can schedule the stanza's
+/// normal ACK. A conflicting notification must fail before the first one is
+/// handed to the durability hook (which may itself send `hist_sync`).
+fn history_sync_first_plaintexts(
+    deferred: Vec<DeferredPlaintext>,
+) -> anyhow::Result<Vec<DeferredPlaintext>> {
+    let mut reordered = Vec::with_capacity(deferred.len());
+    let mut first_history: Option<Vec<u8>> = None;
+    for item in deferred {
+        let (_, history) =
+            wacore::messages::unpad_plaintext(item.plaintext.clone(), item.padding_version)
+                .and_then(wacore::messages::decode_unpadded_detached_history_sync)?;
+        let encoded = history
+            .as_ref()
+            .map(crate::history_sync::encode_notification);
+        if let Some(bytes) = encoded.as_ref() {
+            anyhow::ensure!(
+                first_history.as_ref().is_none_or(|first| first == bytes),
+                "divergent history notifications in one stanza"
+            );
+            first_history.get_or_insert_with(|| bytes.clone());
+        }
+        reordered.push((encoded.is_some(), item));
+    }
+    reordered.sort_by_key(|(history, _)| !history);
+    Ok(reordered.into_iter().map(|(_, item)| item).collect())
+}
+
 /// A `StdRng` that seeds itself on first draw.
 ///
 /// The decrypt loop needs a CSPRNG only on the DH-ratchet step, which most
@@ -725,8 +753,10 @@ impl Client {
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
-        for payload in bot_payloads {
-            self.handle_msmsg_payload(&info, payload).await;
+        if !session_outcome.history_sync_deferred {
+            for payload in bot_payloads {
+                self.handle_msmsg_payload(&info, payload).await;
+            }
         }
 
         // Live: coalesce the receive-side flush. A lost advance re-derives
@@ -1435,6 +1465,26 @@ impl Client {
         // serial chat-lane worker, not this guard. Matches whatsmeow.
         drop(session_guard);
 
+        // A single stanza can carry more than one encrypted plaintext. Commit
+        // paths for ordinary siblings schedule the stanza's normal ACK, so a
+        // history notification must be found and made durable first. Decode
+        // this rare, self-only hook path before dispatching any sibling.
+        if self.history_sync_durability_hook.get().is_some() && info.source.is_from_me {
+            deferred = match history_sync_first_plaintexts(deferred) {
+                Ok(reordered) => reordered,
+                Err(error) => {
+                    log::warn!(
+                        "[msg:{}] Unable to preflight self plaintext before ACK: {error:?}",
+                        info.id
+                    );
+                    outcome.had_failure = true;
+                    outcome.plaintext_failed = true;
+                    outcome.history_sync_deferred = true;
+                    return outcome;
+                }
+            };
+        }
+
         for DeferredPlaintext {
             enc_type,
             plaintext,
@@ -1461,6 +1511,11 @@ impl Client {
                 Ok(plaintext_outcome) => {
                     outcome.dispatched |= plaintext_outcome.dispatched;
                     outcome.skdm_only |= plaintext_outcome.skdm_only;
+                    outcome.had_failure |= plaintext_outcome.history_sync_deferred;
+                    outcome.history_sync_deferred |= plaintext_outcome.history_sync_deferred;
+                    if plaintext_outcome.history_sync_deferred {
+                        break;
+                    }
                 }
                 Err(e) => {
                     log::warn!(
@@ -1946,8 +2001,12 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                self.handle_history_sync(info.id.to_string(), history_sync)
-                    .await;
+                if !self.handle_history_sync_durable(info, history_sync).await {
+                    return Ok(PlaintextHandleOutcome {
+                        history_sync_deferred: true,
+                        ..Default::default()
+                    });
+                }
             } else {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
@@ -2280,8 +2339,63 @@ mod enc_bucket_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{DeferredPlaintext, history_sync_first_plaintexts};
     use crate::test_utils::create_test_client_with_failing_http;
     use wacore_binary::Jid;
+    use waproto::whatsapp as wa;
+
+    fn deferred_message(message: wa::Message, enc_index: usize) -> DeferredPlaintext {
+        DeferredPlaintext {
+            enc_type: "msg",
+            plaintext: wacore::messages::MessageUtils::encode_and_pad(&message),
+            padding_version: 2,
+            enc_index,
+            state: None,
+            session_type: None,
+        }
+    }
+
+    fn history_message(progress: u32) -> wa::Message {
+        wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                history_sync_notification: buffa::MessageField::some(
+                    wa::message::HistorySyncNotification {
+                        progress: Some(progress),
+                        initial_hist_bootstrap_inline_payload: Some(vec![1, 2, 3]),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_preflight_orders_notification_before_normal_ack_source() {
+        let deferred = vec![
+            deferred_message(
+                wa::Message {
+                    conversation: Some("ordinary".into()),
+                    ..Default::default()
+                },
+                0,
+            ),
+            deferred_message(history_message(40), 1),
+        ];
+        let ordered = history_sync_first_plaintexts(deferred).unwrap();
+        assert_eq!(ordered[0].enc_index, 1);
+        assert_eq!(ordered[1].enc_index, 0);
+    }
+
+    #[test]
+    fn history_preflight_rejects_divergent_siblings_before_dispatch() {
+        let deferred = vec![
+            deferred_message(history_message(40), 0),
+            deferred_message(history_message(41), 1),
+        ];
+        assert!(history_sync_first_plaintexts(deferred).is_err());
+    }
 
     // The offline path batches the user for a deferred usync and dedups repeated
     // requests, so a retry storm from one unknown device cannot fan out into a

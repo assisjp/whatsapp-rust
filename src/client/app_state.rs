@@ -972,8 +972,13 @@ impl Client {
                 notification,
                 mut tracker,
             } => {
-                self.process_history_sync_task_tracked(message_id, *notification, &mut tracker)
-                    .await;
+                self.process_history_sync_task_tracked(
+                    message_id,
+                    *notification,
+                    &mut tracker,
+                    None,
+                )
+                .await;
             }
             MajorSyncTask::AppStateSync { name, full_sync } => {
                 // Reserve the collection like every other sync path does.

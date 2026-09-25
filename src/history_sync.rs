@@ -12,6 +12,28 @@ use wacore_binary::{Jid, JidExt as _};
 
 use crate::client::Client;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
+use crate::types::history_sync_durability::HistorySyncKey;
+use crate::types::message::MessageInfo;
+use buffa::Message as _;
+
+const HISTORY_PENDING_PREFIX: &str = "history-sync:";
+
+fn pending_history_id(id: &str) -> String {
+    format!("{HISTORY_PENDING_PREFIX}{id}")
+}
+
+pub(crate) fn encode_notification(notification: &DetachedHistorySyncNotification) -> Vec<u8> {
+    let mut encoded = notification.notification.clone();
+    if let Some(inline) = &notification.inline_payload {
+        encoded.initial_hist_bootstrap_inline_payload = Some(inline.to_vec());
+    }
+    encoded.encode_to_vec()
+}
+
+fn decode_notification(bytes: &[u8]) -> anyhow::Result<DetachedHistorySyncNotification> {
+    let notification = wa::message::HistorySyncNotification::decode_from_slice(bytes)?;
+    Ok(notification.into())
+}
 
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
@@ -256,6 +278,164 @@ impl HistoryMsgSecretRecordVisitor for &mut HistorySecretSeedCollector {
 }
 
 impl Client {
+    /// Buffer the original notification before either receipt. A subsequent
+    /// duplicate can replay this copy even if its Signal counter has advanced.
+    pub(crate) async fn handle_history_sync_durable(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        notification: DetachedHistorySyncNotification,
+    ) -> bool {
+        if self.history_sync_durability_hook.get().is_none() {
+            self.handle_history_sync(info.id.to_string(), notification)
+                .await;
+            return true;
+        }
+        let key = HistorySyncKey {
+            chat: info.source.chat.to_string(),
+            sender: info.source.sender.to_string(),
+            id: info.id.to_string(),
+        };
+        self.commit_history_sync_notification(&key, notification)
+            .await
+    }
+
+    /// Replay a notification durably retained by a host application. This is
+    /// safe after restart: the same hook callbacks run again, and the consumer
+    /// must treat identical bytes as an idempotent retry.
+    pub async fn replay_history_sync_notification(
+        self: &Arc<Self>,
+        key: &HistorySyncKey,
+        notification: &[u8],
+    ) -> anyhow::Result<()> {
+        if self.history_sync_durability_hook.get().is_none() {
+            anyhow::bail!("history sync durability hook is not configured");
+        }
+        let notification = decode_notification(notification)?;
+        if self
+            .commit_history_sync_notification(key, notification)
+            .await
+        {
+            Ok(())
+        } else {
+            anyhow::bail!("history sync replay did not commit; retry later")
+        }
+    }
+
+    async fn commit_history_sync_notification(
+        self: &Arc<Self>,
+        key: &HistorySyncKey,
+        notification: DetachedHistorySyncNotification,
+    ) -> bool {
+        let Some(hook) = self.history_sync_durability_hook.get() else {
+            return false;
+        };
+        let pending_id = pending_history_id(&key.id);
+        let bytes = encode_notification(&notification);
+        let backend = self.persistence_manager.backend();
+        let buffered = match backend
+            .get_pending_inbound(&key.chat, &key.sender, &pending_id)
+            .await
+        {
+            Ok(Some(existing)) if existing != bytes => {
+                log::error!(
+                    "History sync notification changed for the same chat/sender/id; suppressing receipts"
+                );
+                return false;
+            }
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                if let Err(error) = backend
+                    .store_pending_inbound(&key.chat, &key.sender, &pending_id, &bytes)
+                    .await
+                {
+                    log::error!(
+                        "Failed to buffer history sync notification; suppressing receipts: {error:?}"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(error) => {
+                log::error!("Failed to read history sync buffer; suppressing receipts: {error:?}");
+                false
+            }
+        };
+        let metadata = history_sync_metadata(&notification);
+        if let Err(error) = hook.on_notification(&key, &metadata, &bytes).await {
+            log::warn!("History sync notification hook failed; suppressing receipts: {error:?}");
+            return false;
+        }
+        if !buffered {
+            return false;
+        }
+        let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
+        let mut tracker = self.begin_history_sync_task(payload_bytes);
+        if !self
+            .process_history_sync_task_tracked(
+                key.id.clone(),
+                notification,
+                &mut tracker,
+                Some(&key),
+            )
+            .await
+        {
+            return false;
+        }
+        if let Err(error) = backend
+            .delete_pending_inbound(&key.chat, &key.sender, &pending_id)
+            .await
+        {
+            log::warn!("History sync committed but pending cleanup failed: {error:?}");
+        }
+        true
+    }
+
+    /// Retry a retained notification on Signal duplicate/redelivery. A read
+    /// error fails closed; a missing row is a genuine duplicate for this hook.
+    pub(crate) async fn replay_pending_history_sync(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) -> Option<bool> {
+        self.history_sync_durability_hook.get()?;
+        if !info.source.is_from_me {
+            return None;
+        }
+        let backend = self.persistence_manager.backend();
+        let pending_id = pending_history_id(&info.id);
+        match backend
+            .get_pending_inbound(
+                &info.source.chat.to_string(),
+                &info.source.sender.to_string(),
+                &pending_id,
+            )
+            .await
+        {
+            Ok(Some(bytes)) => match decode_notification(&bytes) {
+                Ok(notification) => {
+                    let committed = self.handle_history_sync_durable(info, notification).await;
+                    if committed {
+                        self.ack_received_message(info);
+                    }
+                    Some(committed)
+                }
+                Err(error) => {
+                    log::error!(
+                        "Buffered history sync notification is corrupt; suppressing ACK: {error:?}"
+                    );
+                    Some(false)
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                log::error!(
+                    "Failed reading pending history sync on redelivery; suppressing ACK: {error:?}"
+                );
+                Some(false)
+            }
+        }
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync", level = "debug", skip_all, fields(msg_id = %message_id)))]
     pub(crate) async fn handle_history_sync(
         self: &Arc<Self>,
@@ -335,7 +515,7 @@ impl Client {
     ) {
         let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
         let mut tracker = self.begin_history_sync_task(payload_bytes);
-        self.process_history_sync_task_tracked(message_id, notification, &mut tracker)
+        self.process_history_sync_task_tracked(message_id, notification, &mut tracker, None)
             .await;
     }
 
@@ -345,10 +525,11 @@ impl Client {
         message_id: String,
         notification: DetachedHistorySyncNotification,
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
-    ) {
+        durable_key: Option<&HistorySyncKey>,
+    ) -> bool {
         if self.is_shutting_down() {
             log::debug!("Aborting history sync {} before processing", message_id);
-            return;
+            return false;
         }
 
         let DetachedHistorySyncNotification {
@@ -363,20 +544,23 @@ impl Client {
             notification.sync_type
         );
 
-        self.send_protocol_receipt(
-            message_id.clone(),
-            crate::types::presence::ReceiptType::HistorySync,
-        )
-        .await;
+        if durable_key.is_none() {
+            self.send_protocol_receipt(
+                message_id.clone(),
+                crate::types::presence::ReceiptType::HistorySync,
+            )
+            .await;
+        }
 
         if self.is_shutting_down() {
             log::debug!(
                 "Aborting history sync {} after receipt during shutdown",
                 message_id
             );
-            return;
+            return false;
         }
 
+        let inline_payload_len = inline_payload.as_ref().map(Bytes::len);
         // Use take() to avoid cloning large payloads - moves ownership instead
         let (compressed_data, payload_bytes) = if let Some(inline_payload) = inline_payload {
             log::info!(
@@ -392,7 +576,7 @@ impl Client {
                     "Aborting history sync {} before blob download: client disconnected",
                     message_id
                 );
-                return;
+                return false;
             }
             // The native in-memory downloader streams decryption and safely
             // pre-sizes its fresh retry buffer from the declared file length.
@@ -416,11 +600,35 @@ impl Client {
                     } else {
                         log::error!("Failed to download history sync blob: {:?}", e);
                     }
-                    return;
+                    return false;
                 }
             }
         };
         tracker.set_payload_bytes(payload_bytes);
+
+        if let Some(key) = durable_key {
+            let Some(hook) = self.history_sync_durability_hook.get() else {
+                log::error!("History sync durability hook disappeared; suppressing receipts");
+                return false;
+            };
+            let metadata = HistorySyncMetadata {
+                sync_type: notification.sync_type.map(|sync_type| sync_type as i32),
+                chunk_order: notification.chunk_order,
+                progress: notification.progress,
+                file_length: notification.file_length,
+                inline_payload_len,
+                peer_data_request_session_id: notification.peer_data_request_session_id.as_deref(),
+            };
+            if let Err(error) = hook
+                .on_compressed_chunk(key, &metadata, &compressed_data)
+                .await
+            {
+                log::warn!(
+                    "History sync compressed-chunk hook failed; suppressing receipts: {error:?}"
+                );
+                return false;
+            }
+        }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
@@ -469,11 +677,18 @@ impl Client {
                 "Aborting history sync {} after parse during shutdown",
                 message_id
             );
-            return;
+            return false;
         }
 
         match parse_result {
             Some((Ok(sync_result), secret_entries)) => {
+                if durable_key.is_some() {
+                    self.send_protocol_receipt(
+                        message_id.clone(),
+                        crate::types::presence::ReceiptType::HistorySync,
+                    )
+                    .await;
+                }
                 log::info!(
                     "Successfully processed HistorySync (message {message_id}); {} conversations",
                     sync_result.conversations_processed
@@ -564,11 +779,14 @@ impl Client {
             }
             Some((Err(e), _)) => {
                 log::error!("Failed to process HistorySync data: {:?}", e);
+                return false;
             }
             None => {
                 log::error!("History sync blocking task was cancelled");
+                return false;
             }
         }
+        true
     }
 
     #[cfg_attr(
@@ -772,6 +990,7 @@ mod tests {
     use buffa::Message as ProtoMessage;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use waproto::whatsapp as wa;
     use waproto::whatsapp::message::HistorySyncNotification;
@@ -804,10 +1023,254 @@ mod tests {
             chunk_order: Some(7),
             progress: Some(55),
             peer_data_request_session_id: Some("session-test".to_string()),
-            initial_hist_bootstrap_inline_payload: Some(vec![1, 2, 3]),
+            initial_hist_bootstrap_inline_payload: Some(compress_history_sync(&wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+                ..Default::default()
+            })),
             ..Default::default()
         }
         .into()
+    }
+
+    struct RecordingDurability {
+        notifications: AtomicUsize,
+        chunks: AtomicUsize,
+        fail_notification: AtomicBool,
+        fail_chunk: AtomicBool,
+        expect_invalid_chunk: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::HistorySyncDurabilityHook for RecordingDurability {
+        async fn on_notification(
+            &self,
+            key: &HistorySyncKey,
+            metadata: &HistorySyncMetadata<'_>,
+            notification: &[u8],
+        ) -> anyhow::Result<()> {
+            assert_eq!(key.chat, "5511000000001@s.whatsapp.net");
+            assert_eq!(metadata.chunk_order, Some(7));
+            let decoded = HistorySyncNotification::decode_from_slice(notification)?;
+            let expected = if self.expect_invalid_chunk.load(Ordering::SeqCst) {
+                vec![1, 2, 3]
+            } else {
+                admission_notification().inline_payload.unwrap().to_vec()
+            };
+            assert_eq!(
+                decoded.initial_hist_bootstrap_inline_payload,
+                Some(expected)
+            );
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+            if self.fail_notification.load(Ordering::SeqCst) {
+                anyhow::bail!("notification storage failed");
+            }
+            Ok(())
+        }
+
+        async fn on_compressed_chunk(
+            &self,
+            key: &HistorySyncKey,
+            metadata: &HistorySyncMetadata<'_>,
+            compressed: &[u8],
+        ) -> anyhow::Result<()> {
+            assert_eq!(key.sender, "5511000000001:0@s.whatsapp.net");
+            assert_eq!(metadata.file_length, Some(42));
+            if self.expect_invalid_chunk.load(Ordering::SeqCst) {
+                assert_eq!(compressed, &[1, 2, 3]);
+            } else {
+                assert_eq!(
+                    compressed,
+                    admission_notification().inline_payload.as_deref().unwrap()
+                );
+            }
+            self.chunks.fetch_add(1, Ordering::SeqCst);
+            if self.fail_chunk.load(Ordering::SeqCst) {
+                anyhow::bail!("chunk storage failed");
+            }
+            Ok(())
+        }
+    }
+
+    fn durable_info(id: &str) -> Arc<MessageInfo> {
+        Arc::new(MessageInfo {
+            id: id.into(),
+            source: crate::types::message::MessageSource {
+                chat: "5511000000001@s.whatsapp.net".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn durable_client() -> (
+        Arc<Client>,
+        Arc<RecordingDurability>,
+        futures::channel::oneshot::Receiver<Arc<wacore_binary::Node>>,
+    ) {
+        let admission = Arc::new(RecordingAdmission::new(HistorySyncDecision::Accept));
+        let (client, receipt) = client_with_receipt_waiter("durable_history", admission).await;
+        let hook = Arc::new(RecordingDurability {
+            notifications: AtomicUsize::new(0),
+            chunks: AtomicUsize::new(0),
+            fail_notification: AtomicBool::new(false),
+            fail_chunk: AtomicBool::new(false),
+            expect_invalid_chunk: AtomicBool::new(false),
+        });
+        client
+            .history_sync_durability_hook
+            .set(Arc::clone(&hook) as Arc<dyn crate::HistorySyncDurabilityHook>)
+            .unwrap_or_else(|_| panic!("history hook already set"));
+        (client, hook, receipt)
+    }
+
+    #[tokio::test]
+    async fn history_notification_and_chunk_are_committed_before_receipts() {
+        let (client, hook, receipt) = durable_client().await;
+        let info = durable_info("HISTORY-DURABLE");
+        assert!(
+            client
+                .handle_history_sync_durable(&info, admission_notification())
+                .await
+        );
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.chunks.load(Ordering::SeqCst), 1);
+        let receipt = receipt.await.expect("history receipt after both commits");
+        assert_eq!(
+            receipt.attrs().optional_string("type").as_deref(),
+            Some("hist_sync")
+        );
+        let pending = client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(
+                &info.source.chat.to_string(),
+                &info.source.sender.to_string(),
+                &pending_history_id(&info.id),
+            )
+            .await
+            .unwrap();
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_stays_buffered_and_replays_on_redelivery() {
+        let (client, hook, mut receipt) = durable_client().await;
+        let info = durable_info("HISTORY-REPLAY");
+        hook.fail_chunk.store(true, Ordering::SeqCst);
+        assert!(
+            !client
+                .handle_history_sync_durable(&info, admission_notification())
+                .await
+        );
+        assert!(receipt.try_recv().unwrap().is_none());
+        let pending = client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(
+                &info.source.chat.to_string(),
+                &info.source.sender.to_string(),
+                &pending_history_id(&info.id),
+            )
+            .await
+            .unwrap();
+        assert!(pending.is_some());
+        hook.fail_chunk.store(false, Ordering::SeqCst);
+        assert_eq!(client.replay_pending_history_sync(&info).await, Some(true));
+        let receipt = receipt.await.expect("receipt after replay");
+        assert_eq!(
+            receipt.attrs().optional_string("type").as_deref(),
+            Some("hist_sync")
+        );
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), 2);
+        assert_eq!(hook.chunks.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_compressed_chunk_never_marks_notification_committed() {
+        let (client, hook, mut receipt) = durable_client().await;
+        let info = durable_info("HISTORY-PARSE-FAIL");
+        hook.expect_invalid_chunk.store(true, Ordering::SeqCst);
+        let mut notification = admission_notification();
+        notification.inline_payload = Some(Bytes::from_static(&[1, 2, 3]));
+
+        assert!(
+            !client
+                .handle_history_sync_durable(&info, notification)
+                .await
+        );
+        assert!(receipt.try_recv().unwrap().is_none());
+        assert_eq!(client.replay_pending_history_sync(&info).await, Some(false));
+        assert!(receipt.try_recv().unwrap().is_none());
+        assert_eq!(hook.chunks.load(Ordering::SeqCst), 2);
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    &pending_history_id(&info.id),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_can_replay_the_retained_notification_after_restart() {
+        let (client, hook, receipt) = durable_client().await;
+        let info = durable_info("HISTORY-HOST-REPLAY");
+        hook.fail_chunk.store(true, Ordering::SeqCst);
+        assert!(
+            !client
+                .handle_history_sync_durable(&info, admission_notification())
+                .await
+        );
+        let key = HistorySyncKey {
+            chat: info.source.chat.to_string(),
+            sender: info.source.sender.to_string(),
+            id: info.id.to_string(),
+        };
+        let notification = client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(&key.chat, &key.sender, &pending_history_id(&key.id))
+            .await
+            .unwrap()
+            .expect("retained notification");
+        hook.fail_chunk.store(false, Ordering::SeqCst);
+        client
+            .replay_history_sync_notification(&key, &notification)
+            .await
+            .unwrap();
+        let receipt = receipt.await.expect("receipt after host replay");
+        assert_eq!(
+            receipt.attrs().optional_string("type").as_deref(),
+            Some("hist_sync")
+        );
+        assert_eq!(hook.chunks.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn divergent_notification_never_overwrites_a_pending_copy() {
+        let (client, hook, mut receipt) = durable_client().await;
+        let info = durable_info("HISTORY-CONFLICT");
+        hook.fail_notification.store(true, Ordering::SeqCst);
+        assert!(
+            !client
+                .handle_history_sync_durable(&info, admission_notification())
+                .await
+        );
+        let mut divergent = admission_notification();
+        divergent.notification.progress = Some(56);
+        hook.fail_notification.store(false, Ordering::SeqCst);
+        assert!(!client.handle_history_sync_durable(&info, divergent).await);
+        assert!(receipt.try_recv().unwrap().is_none());
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.chunks.load(Ordering::SeqCst), 0);
     }
 
     async fn client_with_receipt_waiter(
@@ -842,8 +1305,22 @@ mod tests {
         assert_eq!(metadata.chunk_order, Some(7));
         assert_eq!(metadata.progress, Some(55));
         assert_eq!(metadata.file_length, Some(42));
-        assert_eq!(metadata.inline_payload_len, Some(3));
+        assert_eq!(
+            metadata.inline_payload_len,
+            Some(notification.inline_payload.as_ref().unwrap().len())
+        );
         assert_eq!(metadata.peer_data_request_session_id, Some("session-test"));
+    }
+
+    #[test]
+    fn history_sync_metadata_default_has_no_claimed_wire_values() {
+        let metadata = HistorySyncMetadata::default();
+        assert_eq!(metadata.sync_type, None);
+        assert_eq!(metadata.chunk_order, None);
+        assert_eq!(metadata.progress, None);
+        assert_eq!(metadata.file_length, None);
+        assert_eq!(metadata.inline_payload_len, None);
+        assert_eq!(metadata.peer_data_request_session_id, None);
     }
 
     #[tokio::test]
