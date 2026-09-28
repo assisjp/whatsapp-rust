@@ -222,6 +222,20 @@ pub mod codec {
         msg.encode_to_vec()
     }
 
+    #[inline(never)]
+    pub fn history_sync_notification_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::message::HistorySyncNotification, buffa::DecodeError> {
+        whatsapp::message::HistorySyncNotification::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn history_sync_notification_to_vec(
+        notification: &whatsapp::message::HistorySyncNotification,
+    ) -> Vec<u8> {
+        notification.encode_to_vec()
+    }
+
     /// History-sync streaming decodes individual `HistorySyncMsg`/`Conversation`
     /// records; pinning them here keeps their nested `WebMessageInfo`/`Message`
     /// decode tree from being re-instantiated in the calling crate.

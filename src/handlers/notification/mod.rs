@@ -29,11 +29,31 @@ impl StanzaHandler for NotificationHandler {
         &self,
         client: Arc<Client>,
         node: Arc<OwnedNodeRef>,
-        _cancelled: &mut bool,
+        cancelled: &mut bool,
     ) -> bool {
+        if let Err(error) = persist_group_notification(&client, &node).await {
+            // Claim the stanza but withhold the generic ACK and all group effects.
+            *cancelled = true;
+            log::warn!("Group notification durability hook failed; ACK withheld: {error:#}");
+            return true;
+        }
         handle_notification_impl(&client, node).await;
         true
     }
+}
+
+/// Run the opt-in gate once for the complete notification, including unknown
+/// actions and `groups_dirty`. No parsing defaults become persistence identity.
+async fn persist_group_notification(
+    client: &Arc<Client>,
+    node: &Arc<OwnedNodeRef>,
+) -> anyhow::Result<()> {
+    if node.get().attrs().optional_string("type").as_deref() == Some("w:gp2")
+        && let Some(hook) = client.group_notification_durability_hook.get()
+    {
+        hook.on_notification(Arc::clone(node)).await?;
+    }
+    Ok(())
 }
 
 /// Dispatch notification by type.
@@ -136,6 +156,9 @@ pub(crate) use device::*;
 use groups::*;
 use privacy_business::*;
 use profile::*;
+
+#[cfg(test)]
+mod durability_tests;
 
 #[cfg(test)]
 mod tests {

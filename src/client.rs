@@ -1924,6 +1924,10 @@ pub struct Client {
     /// at-most-once behavior with zero overhead.
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
+    /// Optional raw group-notification gate, awaited before processing and ACK.
+    pub(crate) group_notification_durability_hook: std::sync::OnceLock<
+        Arc<dyn crate::types::group_notification_durability::GroupNotificationDurabilityHook>,
+    >,
     pub(crate) history_sync_durability_hook: std::sync::OnceLock<
         Arc<dyn crate::types::history_sync_durability::HistorySyncDurabilityHook>,
     >,

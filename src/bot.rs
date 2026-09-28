@@ -11,6 +11,7 @@ use crate::store::traits::Backend;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
+use crate::types::group_notification_durability::GroupNotificationDurabilityHook;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::history_sync_durability::HistorySyncDurabilityHook;
 use crate::types::message::MessageInfo;
@@ -716,6 +717,7 @@ pub struct BotBuilder<
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     override_version: Option<(u32, u32, u32)>,
@@ -750,6 +752,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            group_notification_durability_hook: None,
             history_sync_durability_hook: None,
             history_sync_admission: None,
             override_version: None,
@@ -788,6 +791,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
             inbound_durability_hook: self.inbound_durability_hook,
+            group_notification_durability_hook: self.group_notification_durability_hook,
             history_sync_durability_hook: self.history_sync_durability_hook,
             history_sync_admission: self.history_sync_admission,
             override_version: self.override_version,
@@ -1320,6 +1324,25 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Persist each complete `w:gp2` notification before group processing and ACK.
+    /// See [`GroupNotificationDurabilityHook`] for failure and identity caveats.
+    pub fn with_group_notification_durability_hook<Dh>(mut self, hook: Dh) -> Self
+    where
+        Dh: GroupNotificationDurabilityHook + 'static,
+    {
+        self.group_notification_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Install an already-shared group-notification durability hook.
+    pub fn with_group_notification_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn GroupNotificationDurabilityHook>,
+    ) -> Self {
+        self.group_notification_durability_hook = Some(hook);
+        self
+    }
+
     /// Register an already-shared history-sync admission policy.
     pub fn with_history_sync_admission_arc(
         mut self,
@@ -1621,6 +1644,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
         if let Some(hook) = self.inbound_durability_hook {
             client_builder = client_builder.with_inbound_durability_hook_arc(hook);
+        }
+        if let Some(hook) = self.group_notification_durability_hook {
+            client_builder = client_builder.with_group_notification_durability_hook_arc(hook);
         }
         if let Some(hook) = self.history_sync_durability_hook {
             client_builder = client_builder.with_history_sync_durability_hook_arc(hook);

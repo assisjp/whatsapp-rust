@@ -3676,7 +3676,7 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
 /// structs). A struct-level delta alone does not prove the per-client saving,
 /// since neighbor-field padding could absorb part of it. The current fixed
-/// client layout is 4312 B before feature-sized fields. The history-sync
+/// client layout is 4360 B before feature-sized fields. The history-sync
 /// admission policy is an immutable optional `Arc`, so it avoids the
 /// synchronization-cell cost of the former `OnceLock` field.
 ///
@@ -3693,7 +3693,7 @@ fn client_size_pins_runtime_cache_config_saving() {
     // size-varying attachment is measured in this same build and stacked on
     // top, so no feature combination false-fails: only an unaccounted layout
     // move trips the assert.
-    let mut expected = 4312 + size_of::<subsystem::Subsystems>();
+    let mut expected = 4360 + size_of::<subsystem::Subsystems>();
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }

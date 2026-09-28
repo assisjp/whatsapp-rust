@@ -9,13 +9,11 @@ use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
 use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
-use waproto::whatsapp as wa;
 
 use crate::client::Client;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
 use crate::types::history_sync_durability::HistorySyncKey;
 use crate::types::message::MessageInfo;
-use buffa::Message as _;
 
 const HISTORY_PENDING_PREFIX: &str = "history-sync:";
 
@@ -28,11 +26,11 @@ pub(crate) fn encode_notification(notification: &DetachedHistorySyncNotification
     if let Some(inline) = &notification.inline_payload {
         encoded.initial_hist_bootstrap_inline_payload = Some(inline.to_vec());
     }
-    encoded.encode_to_vec()
+    waproto::codec::history_sync_notification_to_vec(&encoded)
 }
 
 fn decode_notification(bytes: &[u8]) -> anyhow::Result<DetachedHistorySyncNotification> {
-    let notification = wa::message::HistorySyncNotification::decode_from_slice(bytes)?;
+    let notification = waproto::codec::history_sync_notification_decode(bytes)?;
     Ok(notification.into())
 }
 
@@ -363,7 +361,7 @@ impl Client {
             }
         };
         let metadata = history_sync_metadata(&notification);
-        if let Err(error) = hook.on_notification(&key, &metadata, &bytes).await {
+        if let Err(error) = hook.on_notification(key, &metadata, &bytes).await {
             log::warn!("History sync notification hook failed; suppressing receipts: {error:?}");
             return false;
         }
@@ -377,7 +375,7 @@ impl Client {
                 key.id.clone(),
                 notification,
                 &mut tracker,
-                Some(&key),
+                Some(key),
             )
             .await
         {

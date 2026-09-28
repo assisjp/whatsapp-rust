@@ -363,7 +363,7 @@ impl Client {
             syncd_collection_fatal_recovery_request: buffa::MessageField::some(
                 wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
                     collection_name: Some(collection.to_string()),
-                    timestamp: Some(wacore::time::now_secs() as i64),
+                    timestamp: Some(wacore::time::now_secs()),
                 },
             ),
             ..Default::default()

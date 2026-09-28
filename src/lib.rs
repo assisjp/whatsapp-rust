@@ -235,6 +235,7 @@ pub use client::{
     SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
+pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
