@@ -3591,6 +3591,16 @@ impl CallHandle {
         &self.call_id
     }
 
+    /// The signaling phase owned by this handle's registry generation.
+    ///
+    /// `None` means this generation was removed or superseded. This never
+    /// observes a same-call-id replacement's phase. Media readiness remains
+    /// separately observable through [`Self::events`] and media diagnostics.
+    pub fn phase(&self) -> Option<wacore::voip_control::CallPhase> {
+        self.client_registry
+            .phase_if_current(&self.call_id, self.generation)
+    }
+
     /// Media counters for this call: what arrived, what was discarded, and where.
     ///
     /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
