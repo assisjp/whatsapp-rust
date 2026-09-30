@@ -90,6 +90,60 @@ impl StanzaHandler for CallHandler {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-control")]
                 let mut call = call;
+                // Bind direct answers before any await. A trusted namespace lookup may suspend;
+                // the captured generation must still own the call when its answer is committed.
+                #[cfg(feature = "voip-control")]
+                let direct_accept = if matches!(&call.action, CallAction::Accept { .. }) {
+                    let registry = client.call_registry();
+                    match registry.generation_of(call.action.call_id()) {
+                        Some(generation)
+                            if registry
+                                .is_group_call_if_current(call.action.call_id(), generation) =>
+                        {
+                            None
+                        }
+                        Some(generation) => {
+                            let Some(session) =
+                                registry.snapshot_if_current(call.action.call_id(), generation)
+                            else {
+                                return true;
+                            };
+                            if session.direction != wacore::voip_control::CallDirection::Outgoing {
+                                return true;
+                            }
+                            let Some(sender) = canonical_call_identity(
+                                &client,
+                                &routed_call_sender(&call),
+                                &session.peer_jid,
+                            )
+                            .await
+                            else {
+                                return true;
+                            };
+                            let Some(creator) = canonical_call_identity(
+                                &client,
+                                call.action.call_creator(),
+                                &session.call_creator,
+                            )
+                            .await
+                            else {
+                                return true;
+                            };
+                            if !registry.is_current(call.action.call_id(), generation) {
+                                return true;
+                            }
+                            if call.participant.is_some() {
+                                call.participant = Some(sender.clone());
+                            } else {
+                                call.from = sender.clone();
+                            }
+                            Some((generation, creator, sender))
+                        }
+                        None => return true,
+                    }
+                } else {
+                    None
+                };
                 #[cfg(feature = "voip-control")]
                 if matches!(
                     &call.action,
@@ -320,8 +374,10 @@ impl StanzaHandler for CallHandler {
                     if matches!(
                         &call.action,
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
-                    ) && let Some(generation) =
-                        client.call_registry().generation_of(call.action.call_id())
+                    ) && let Some(generation) = direct_accept
+                        .as_ref()
+                        .map(|(generation, _, _)| *generation)
+                        .or_else(|| client.call_registry().generation_of(call.action.call_id()))
                     {
                         let capability = nr
                             .children()
@@ -407,23 +463,10 @@ impl StanzaHandler for CallHandler {
                         let sender = routed_call_sender(&call);
                         // Record the device that answered so a later <terminate> targets it (call
                         // signaling is addressed per device, not to the bare peer the offer rang).
-                        client
-                            .call_registry()
-                            .set_answering_device(call.action.call_id(), sender.clone());
-                        // The answering device's camera rotation, announced on
-                        // the `<accept>`'s `<video>` and nowhere else until it
-                        // turns. After `set_answering_device`, so the registry
-                        // can tell a winning answer from a late sibling's.
-                        if let Some(orientation) = call.video_orientation
-                            && let Some(generation) =
-                                client.call_registry().generation_of(call.action.call_id())
-                        {
-                            client.call_registry().set_peer_video_orientation(
-                                call.action.call_id(),
-                                generation,
-                                &sender,
-                                orientation,
-                            );
+                        if direct_accept.is_none() {
+                            client
+                                .call_registry()
+                                .set_answering_device(call.action.call_id(), sender.clone());
                         }
                         // The peer's capability and the answering device land in the same stanza
                         // and both have to be applied before the first inbound packet, so they
@@ -436,15 +479,48 @@ impl StanzaHandler for CallHandler {
                         let audio_codec = client
                             .call_registry()
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
-                        client.call_registry().send_rekey(
-                            call.action.call_id(),
-                            wacore::voip_control::control::PeerAnswer::builder()
-                                .answering_lid(sender.to_string())
-                                .maybe_audio_codec(audio_codec)
-                                .build(),
-                        );
-                        if let Some(generation) =
-                            client.call_registry().generation_of(call.action.call_id())
+                        let answer = wacore::voip_control::control::PeerAnswer::builder()
+                            .answering_lid(sender.to_string())
+                            .maybe_audio_codec(audio_codec)
+                            .build();
+                        if let Some((generation, creator, device)) = direct_accept.as_ref() {
+                            if !client.call_registry().accept_direct_if_current(
+                                call.action.call_id(),
+                                *generation,
+                                creator,
+                                device.clone(),
+                                answer,
+                            ) {
+                                return true;
+                            }
+                        } else {
+                            client
+                                .call_registry()
+                                .send_rekey(call.action.call_id(), answer);
+                        }
+                        // The answering device's camera rotation, announced on
+                        // the `<accept>`'s `<video>` and nowhere else until it
+                        // turns. After `set_answering_device`, so the registry
+                        // can tell a winning answer from a late sibling's.
+                        if let Some(orientation) = call.video_orientation
+                            && let Some(generation) = direct_accept
+                                .as_ref()
+                                .map(|(generation, _, _)| *generation)
+                                .or_else(|| {
+                                    client.call_registry().generation_of(call.action.call_id())
+                                })
+                        {
+                            client.call_registry().set_peer_video_orientation(
+                                call.action.call_id(),
+                                generation,
+                                &sender,
+                                orientation,
+                            );
+                        }
+                        if let Some(generation) = direct_accept
+                            .as_ref()
+                            .map(|(generation, _, _)| *generation)
+                            .or_else(|| client.call_registry().generation_of(call.action.call_id()))
                         {
                             announce_orientation_on_accept(
                                 &client,
@@ -1445,6 +1521,18 @@ fn routed_call_sender(call: &IncomingCall) -> Jid {
     call.participant.as_ref().unwrap_or(&call.from).clone()
 }
 
+/// Reads existing trusted PN/LID identity mappings; a call stanza never teaches this lookup.
+/// Unknown or ambiguous aliases cannot authorize an answer to the current direct call.
+#[cfg(feature = "voip-control")]
+async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid) -> Option<Jid> {
+    let canonical = if observed.server == expected.server {
+        observed.clone()
+    } else {
+        client.swap_pn_lid_namespace(observed).await?
+    };
+    (canonical.to_non_ad() == expected.to_non_ad()).then_some(canonical)
+}
+
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
 async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
     let own_from = match call.from.server {
@@ -1590,6 +1678,78 @@ mod tests {
 
     fn fake_caller_lid() -> Jid {
         Jid::new("111111111111111", Server::Lid)
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_identity_uses_only_trusted_namespace_aliases() {
+        let client = make_sending_client().await;
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("12025550112", Server::Pn).with_device(4);
+        assert!(canonical_call_identity(&client, &pn, &lid).await.is_none());
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &pn.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical_call_identity(&client, &pn, &lid).await,
+            Some(lid.with_device(4))
+        );
+        assert!(
+            canonical_call_identity(&client, &pn, &fake_caller_lid())
+                .await
+                .is_none()
+        );
+        assert!(
+            canonical_call_identity(&client, &Jid::new("GROUP", Server::Call), &lid)
+                .await
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_rejects_forged_sender_and_creator_before_rekey() {
+        let client = make_sending_client().await;
+        let (_, generation) = register_native_opus_call(&client, Vec::new());
+        let rx = client
+            .call_registry()
+            .resident_session("CALL-ID-0001", generation)
+            .unwrap()
+            .take_rekey_receiver()
+            .unwrap();
+        let outsider = Jid::new("222222222222222", Server::Lid);
+        for (sender, creator) in [
+            (outsider.clone(), fake_caller_lid()),
+            (fake_caller_lid(), outsider),
+        ] {
+            let accept = NodeBuilder::new("call")
+                .attr("from", sender)
+                .attr("id", "FORGED-ACCEPT")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("accept")
+                    .attr("call-creator", creator)
+                    .attr("call-id", "CALL-ID-0001")
+                    .build()])
+                .build();
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                    .await
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(
+                client
+                    .call_registry()
+                    .answering_device_if_current("CALL-ID-0001", generation)
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(feature = "voip-control")]

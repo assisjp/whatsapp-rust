@@ -39,14 +39,25 @@ pub use super::MediaStats as CallMediaStats;
 /// numbers cross a task boundary. The drive loop republishes whenever a counter moved, which on a
 /// live call is most iterations, since `rtp_received` moves on every authenticated packet. That is
 /// an uncontended lock at roughly the packet rate; measured, it does not appear in a profile.
-#[derive(Debug, Default)]
-pub struct MediaStatsCell(std::sync::Mutex<CallMediaStats>);
+#[derive(Default)]
+pub struct MediaStatsCell {
+    stats: std::sync::Mutex<CallMediaStats>,
+    connected: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for MediaStatsCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaStatsCell")
+            .field("stats", &self.snapshot())
+            .finish()
+    }
+}
 
 impl MediaStatsCell {
     /// Overwrite the published snapshot. Called by the drive loop; a poisoned lock is ignored,
     /// since a stale diagnostic must never take a live call down.
     pub fn publish(&self, stats: CallMediaStats) {
-        if let Ok(mut slot) = self.0.lock() {
+        if let Ok(mut slot) = self.stats.lock() {
             *slot = stats;
         }
     }
@@ -54,7 +65,26 @@ impl MediaStatsCell {
     /// The most recent snapshot, or zeroes if the lock was poisoned or nothing has published yet.
     #[must_use]
     pub fn snapshot(&self) -> CallMediaStats {
-        self.0.lock().map(|slot| *slot).unwrap_or_default()
+        self.stats.lock().map(|slot| *slot).unwrap_or_default()
+    }
+
+    /// Install the backend's generation-scoped lifecycle hook before its driver starts.
+    /// The hook is consumed once and must not retain the call registry strongly.
+    pub fn on_media_connected(&self, hook: Box<dyn FnOnce() + Send + Sync>) {
+        *self.connected.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+    }
+
+    /// Commit accepted media readiness before attempting public event delivery. Calling twice
+    /// is harmless, and the hook runs outside the cell lock so registry teardown cannot deadlock.
+    pub fn notify_media_connected(&self) {
+        let hook = self
+            .connected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 

@@ -948,6 +948,8 @@ pub struct CallEngine {
     /// order they arrive: inbound media cannot flow before the relay answers our allocate, so arming
     /// on the accept alone reports the allocation interval itself as lost reception.
     peer_has_answered: bool,
+    /// One accepted direct-call media-ready notification per engine, even after relay migration.
+    media_connected_notified: bool,
     started: bool,
     /// A terminal relay-allocate failure was surfaced; the engine goes inert (no keepalive, no
     /// timer, no further transmits) so the driver tears the call down instead of keepaliving a
@@ -1124,6 +1126,7 @@ impl CallEngine {
             allocate_pending: false,
             allocated: false,
             peer_has_answered: false,
+            media_connected_notified: false,
             started: false,
             terminated: false,
             self_participant_id: ssrc::format_e2e_srtp_participant_id(&config.self_lid),
@@ -1752,6 +1755,16 @@ impl CallEngine {
         true
     }
 
+    /// Apply the verified direct answer before committing peer acceptance. A malformed stored
+    /// key must never announce a connected call whose receive path was not installed.
+    pub fn accept_peer_answer(&mut self, now: Millis, answering_peer_lid: &str) -> bool {
+        if !self.rekey_recv(answering_peer_lid) {
+            return false;
+        }
+        self.peer_answered(now);
+        true
+    }
+
     /// Whether outbound video could reach the wire at all right now: a plane
     /// that is up and not gated.
     ///
@@ -1802,6 +1815,21 @@ impl CallEngine {
         // this, so whichever lands second does the arming.
         if self.group.is_none() && self.allocated {
             self.health.media_started(now);
+        }
+        self.maybe_publish_media_connected();
+    }
+
+    fn maybe_publish_media_connected(&mut self) {
+        if !self.media_connected_notified
+            && !self.terminated
+            && self.allocated
+            && self.media.is_some()
+            && self.group.is_none()
+            && (self.direction == CallDirection::Incoming || self.peer_has_answered)
+        {
+            self.media_connected_notified = true;
+            self.outbox
+                .push_back(Output::Event(CallEvent::MediaConnected));
         }
     }
 
@@ -2712,6 +2740,7 @@ impl CallEngine {
                     }
                     self.announce_audio_rtcp_session();
                 }
+                self.maybe_publish_media_connected();
             }
             return;
         }
@@ -4060,6 +4089,22 @@ mod encoded_tests {
             })
             .expect("configure group");
         engine
+    }
+
+    #[test]
+    fn group_allocation_never_emits_direct_media_connected() {
+        let mut eng = group_engine();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocation_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&success));
+        eng.peer_answered(2);
+        assert!(
+            !drain(&mut eng)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::MediaConnected)))
+        );
+        assert!(eng.is_allocated());
     }
 
     /// Hands each group participant its own [`DecodeToConstant`].
@@ -6807,6 +6852,73 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn direct_media_connected_requires_accept_and_allocation_in_either_order() {
+        for accept_first in [false, true] {
+            let mut cfg = config(true);
+            cfg.direction = CallDirection::Outgoing;
+            let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            if accept_first {
+                assert!(eng.accept_peer_answer(1, PEER_LID));
+                assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            }
+            let success = allocate_success(&eng);
+            eng.handle_input(2, Input::RelayPacket(&success));
+            assert_eq!(
+                connected_count(&drain(&mut eng).0),
+                usize::from(accept_first)
+            );
+            if !accept_first {
+                assert!(eng.accept_peer_answer(3, PEER_LID));
+                assert_eq!(connected_count(&drain(&mut eng).0), 1);
+            }
+            assert!(eng.accept_peer_answer(4, PEER_LID));
+            eng.handle_input(4, Input::RelayPacket(&success));
+            assert_eq!(
+                connected_count(&drain(&mut eng).0),
+                0,
+                "connected is one-shot"
+            );
+        }
+    }
+
+    fn connected_count(outputs: &[Output]) -> usize {
+        outputs
+            .iter()
+            .filter(|output| matches!(output, Output::Event(CallEvent::MediaConnected)))
+            .count()
+    }
+
+    #[test]
+    fn incoming_media_connected_requires_a_constructed_media_plane() {
+        for with_media in [false, true] {
+            let mut eng = engine(with_media);
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            let success = allocate_success(&eng);
+            eng.handle_input(1, Input::RelayPacket(&success));
+            assert_eq!(connected_count(&drain(&mut eng).0), usize::from(with_media));
+        }
+    }
+
+    #[test]
+    fn failed_receive_rekey_never_connects_an_outgoing_call() {
+        let mut cfg = config(true);
+        cfg.direction = CallDirection::Outgoing;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&success));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
+        eng.media.as_mut().unwrap().call_key.clear();
+        assert!(!eng.accept_peer_answer(2, PEER_LID));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
+        assert!(!eng.peer_has_answered);
     }
 
     #[test]

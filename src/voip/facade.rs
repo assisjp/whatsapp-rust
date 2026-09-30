@@ -374,6 +374,9 @@ impl<'a> AcceptCall<'a> {
             RegisteredCall::new(self.client, session).await
         };
         let mut teardown = AnswerTeardown::new(self.client, &registration);
+        // A dropped direct startup cannot confirm what its in-flight answer delivered. Reap local
+        // media synchronously; never issue detached wire cleanup after the caller lost its fence.
+        teardown.local_only_on_cancel = !is_group;
         let preaccept_id = self.client.generate_request_id();
         let accept_id = self.client.generate_request_id();
         let (preaccept, accept) = build_answer_signaling(
@@ -1960,6 +1963,15 @@ async fn place_call(
     session.ring_devices = ring_devices.to_vec();
     let _ = session.transition_to(CallPhase::Calling);
     let generation = registry.insert(session);
+    let mut startup = OutgoingStartTeardown {
+        client: client_weak(client),
+        registry: registry.clone(),
+        pending: client.voip_state().pending_outgoing_calls.clone(),
+        call_id: call_id.clone(),
+        offer_stanza_id: offer_stanza_id.clone(),
+        generation,
+        armed: true,
+    };
     registry.set_group_invite_self_device(
         &call_id,
         generation,
@@ -2042,6 +2054,10 @@ async fn place_call(
     // real server). Wait on the ack-waiter with a bounded timeout; attach the engine when the relay
     // lands, else fail the call so a parked wait_ended() resolves.
     spawn_outgoing_relay_waiter(client, call_id.clone(), generation, offer_stanza_id, ack_rx);
+
+    // Ownership now transfers to the handle and its relay waiter. No await may separate this
+    // disarm from returning the handle; until here every cancellation owns local cleanup.
+    startup.armed = false;
 
     Ok(CallHandle {
         call_id: call_id.clone(),
@@ -2538,6 +2554,55 @@ pub(crate) async fn attach_outgoing_relay(
     Ok(true)
 }
 
+const CANCELLED_START_REASON: &str = "call_start_cancelled_remote_unconfirmed";
+
+/// Cancelling startup cannot acknowledge a remote hangup. Publish that uncertainty before closing
+/// the generation's event stream, and stop local media without touching a replacement or the wire.
+fn cancel_start_registration(
+    registry: &wacore::voip_control::registry::CallRegistry,
+    call_id: &str,
+    generation: u64,
+) {
+    registry.send_call_event_if_current(
+        call_id,
+        generation,
+        CallEvent::MediaSetupFailed(CANCELLED_START_REASON.into()),
+    );
+    registry.set_close_reason(
+        call_id,
+        generation,
+        wacore::voip_control::MediaCloseReason::SetupFailed(CANCELLED_START_REASON.into()),
+    );
+    registry.remove_if_current(call_id, generation);
+}
+
+/// Own the outgoing registration from before the offer await until the handle is returned. An
+/// aborted transport write is delivery-ambiguous, so Drop is deliberately synchronous/local only.
+struct OutgoingStartTeardown {
+    client: std::sync::Weak<Client>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>>,
+    call_id: String,
+    offer_stanza_id: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for OutgoingStartTeardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        cancel_start_registration(&self.registry, &self.call_id, self.generation);
+        take_pending_if_current(&self.pending, &self.call_id, self.generation);
+        if let Some(client) = self.client.upgrade() {
+            client
+                .response_waiters_guard()
+                .remove(&self.offer_stanza_id);
+        }
+    }
+}
+
 /// A call generation registered before any fallible answer-side work. Until disarmed, dropping this
 /// guard removes only its own generation, so setup/signaling errors cannot leak a task-less registry
 /// entry or reap a same-call-id replacement.
@@ -2656,6 +2721,9 @@ struct AnswerTeardown {
     armed: bool,
     claimed: bool,
     transition: Option<async_lock::MutexGuardArc<()>>,
+    /// Direct Accept.start owns its registration inside the cancelled future; no asynchronous
+    /// remote retry may outlive the caller's fence. Legacy/group setup retains its own policy.
+    local_only_on_cancel: bool,
 }
 
 struct GroupOfferTeardown {
@@ -2827,6 +2895,7 @@ impl AnswerTeardown {
             armed: false,
             claimed: false,
             transition: None,
+            local_only_on_cancel: false,
         }
     }
 
@@ -2861,6 +2930,10 @@ impl AnswerTeardown {
 impl Drop for AnswerTeardown {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+        if self.local_only_on_cancel {
+            cancel_start_registration(&self.registry, &self.call_id, self.generation);
             return;
         }
         let Some(client) = self.client.upgrade() else {
@@ -3596,7 +3669,7 @@ impl CallHandle {
     /// `None` means this generation was removed or superseded. This never
     /// observes a same-call-id replacement's phase. Media readiness remains
     /// separately observable through [`Self::events`] and media diagnostics.
-    pub fn phase(&self) -> Option<wacore::voip_control::CallPhase> {
+    pub fn phase(&self) -> Option<CallPhase> {
         self.client_registry
             .phase_if_current(&self.call_id, self.generation)
     }
@@ -10522,6 +10595,158 @@ mod tests {
             0,
             "a send failure must reap the registry generation"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_direct_offer_send_reaps_pending_waiter_and_reports_uncertainty() {
+        let (client, _sends) = make_sending_client().await;
+        let (transport, entered, _release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let device = peer_lid();
+        seed_peer_session(&client, &device).await;
+        let own_lid = client.lid().expect("own lid");
+        let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(4);
+        let (speaker_tx, _speaker_rx) = async_channel::bounded::<Vec<i16>>(8);
+        let call_id = "00abcdef0123456789abcdef0123cafe".to_string();
+        let starting_client = client.clone();
+        let starting_id = call_id.clone();
+        let start = tokio::spawn(async move {
+            place_call(
+                &starting_client,
+                starting_id,
+                &peer,
+                &own_lid,
+                &own_lid,
+                std::slice::from_ref(&device),
+                std::slice::from_ref(&device),
+                pcm_audio(Arc::new(mic_rx), Arc::new(speaker_tx)),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("offer send gate")
+            .expect("observer");
+        let generation = client
+            .call_registry()
+            .generation_of(&call_id)
+            .expect("registered before offer await");
+        let media = client
+            .call_registry()
+            .media_session(&call_id, generation)
+            .expect("reserved media");
+        let events = media.subscribe();
+        let waiter_count = client.response_waiters_guard().len();
+        assert!(waiter_count > 0);
+        start.abort();
+        assert!(start.await.err().expect("cancelled startup").is_cancelled());
+        assert_eq!(client.call_registry().generation_of(&call_id), None);
+        assert!(
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.response_waiters_guard().len(), waiter_count - 1);
+        assert!(
+            mic_tx.is_closed(),
+            "startup drop releases the audio endpoints synchronously"
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(CallEvent::MediaSetupFailed(CANCELLED_START_REASON.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_owned_direct_answer_startup_is_local_only_and_reports_uncertainty() {
+        let (client, sends) = make_sending_client().await;
+        let (ready_tx, ready_rx) = async_channel::bounded(1);
+        let starting_client = client.clone();
+        let start = tokio::spawn(async move {
+            let incoming = incoming_offer(false);
+            let mut registration = register_answer(&starting_client, &incoming).await;
+            let mut teardown = AnswerTeardown::new(&starting_client, &registration);
+            teardown.local_only_on_cancel = true;
+            let media = registration
+                .registry
+                .media_session(&registration.call_id, registration.generation)
+                .expect("reserved media");
+            let events = media.subscribe();
+            let (_, accept) = build_answer_signaling(
+                &incoming,
+                AudioFormat::MLOW_16KHZ_60MS,
+                false,
+                false,
+                "CANCEL-PREACCEPT",
+                "CANCEL-ACCEPT",
+            )
+            .expect("answer signaling");
+            send_answer_node(&starting_client, &registration, &mut teardown, accept)
+                .await
+                .expect("accept committed");
+            ready_tx.send(events).await.expect("observer");
+            // These guards are owned inside the cancelled future, matching actual Accept.start.
+            std::future::pending::<()>().await;
+            teardown.disarm();
+            registration.disarm();
+        });
+        let events = tokio::time::timeout(Duration::from_secs(2), ready_rx.recv())
+            .await
+            .expect("accepted startup")
+            .expect("observer");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "only the accepted answer was sent"
+        );
+        start.abort();
+        assert!(start.await.err().expect("cancelled startup").is_cancelled());
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "local teardown finishes before the cancelled task returns"
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(CallEvent::MediaSetupFailed(CANCELLED_START_REASON.into()))
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "cancellation must not enqueue detached wire cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_guard_does_not_touch_a_replacement_generation() {
+        let (client, sends) = make_sending_client().await;
+        let registration = RegisteredCall::new(&client, mk_session()).await;
+        let mut teardown = AnswerTeardown::new(&client, &registration);
+        teardown.local_only_on_cancel = true;
+        teardown.arm();
+        let replacement = client.call_registry().insert(mk_session());
+        let events = client
+            .call_registry()
+            .media_session("CID-FACADE", replacement)
+            .expect("replacement media")
+            .subscribe();
+        drop(teardown);
+        drop(registration);
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(replacement)
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a stale cancellation cannot publish failure into the replacement"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     // Finding I: attach_outgoing_relay removes the pending entry FIRST, then builds the engine. If that

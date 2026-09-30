@@ -303,6 +303,7 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
     if matches!(
         &event,
         CallEvent::RelayAllocated
+            | CallEvent::MediaConnected
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
@@ -756,6 +757,11 @@ async fn run_call_with_clock_and_wallclock(
                     }
                 }
                 Output::Event(ev) => {
+                    if matches!(ev, CallEvent::MediaConnected) {
+                        // Commit lifecycle independently of a full public event queue. This is
+                        // not another subscriber: Receiver clones compete for the same stream.
+                        channels.media_stats.notify_media_connected();
+                    }
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
                     let delivered = publish_engine_event(&channels.events, ev);
                     if keyframe_request {
@@ -1047,8 +1053,7 @@ async fn run_call_with_clock_and_wallclock(
                     // The `<accept>` is also the caller's proof that the callee picked up, which
                     // is what arms the health watchdog: the relay was allocated back when the
                     // server acked the offer, long before anyone answered.
-                    eng.peer_answered(now_ms());
-                    if !eng.rekey_recv(&answer.answering_lid) {
+                    if !eng.accept_peer_answer(now_ms(), &answer.answering_lid) {
                         break 'drive; // malformed stored call_key (a setup invariant violated)
                     }
                 }

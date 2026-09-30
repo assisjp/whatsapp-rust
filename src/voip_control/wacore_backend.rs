@@ -241,6 +241,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         };
 
         let stats = resident.install_fresh_stats_cell();
+        install_media_connected_hook(&registry, &key, &stats);
         // The session has owned the public event stream since reservation, and the `CallHandle`
         // already reads it through `subscribe`: signaling events published before media attaches
         // and the drive loop's media events share that one ordered stream with no install here.
@@ -295,6 +296,22 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         resident.install_drive_task(task);
         Ok(())
     }
+}
+
+/// Commit only the generation whose engine verified direct-call media readiness. A late engine
+/// cannot activate a replacement or keep the registry alive after disconnect.
+fn install_media_connected_hook(
+    registry: &Arc<wacore::voip_control::registry::CallRegistry>,
+    key: &wacore::voip_control::MediaSessionKey,
+    stats: &wacore::voip_control::media_stats::MediaStatsCell,
+) {
+    let registry = Arc::downgrade(registry);
+    let key = key.clone();
+    stats.on_media_connected(Box::new(move || {
+        if let Some(registry) = registry.upgrade() {
+            registry.direct_media_connected_if_current(&key.call_id, key.generation);
+        }
+    }));
 }
 
 /// Adopt the caller-held video state at open time, before the drive loop starts.
@@ -421,6 +438,96 @@ mod tests {
     use wacore::voip_control::{
         MediaAudioFormat, MediaAudioIo, MediaAudioSpec, MediaGroupSpec, MediaSessionKey,
     };
+
+    #[test]
+    fn media_connected_hook_is_once_and_cannot_activate_a_replacement() {
+        use wacore::voip_control::registry::CallRegistry;
+        use wacore::voip_control::{CallPhase, CallSession};
+        let registry = Arc::new(CallRegistry::new());
+        let session = || {
+            let mut session = CallSession::new_outgoing(
+                "MEDIA-PHASE",
+                wacore_binary::Jid::new("2", wacore_binary::Server::Lid),
+                wacore_binary::Jid::new("1", wacore_binary::Server::Lid),
+            );
+            assert!(session.transition_to(CallPhase::Calling));
+            session
+        };
+        let stale = registry.insert(session());
+        let stale_stats = wacore::voip_control::media_stats::MediaStatsCell::default();
+        install_media_connected_hook(
+            &registry,
+            &MediaSessionKey::builder()
+                .call_id("MEDIA-PHASE".into())
+                .generation(stale)
+                .build(),
+            &stale_stats,
+        );
+        let current = registry.insert(session());
+        stale_stats.notify_media_connected();
+        assert_eq!(
+            registry.phase_if_current("MEDIA-PHASE", current),
+            Some(CallPhase::Calling)
+        );
+        let stats = wacore::voip_control::media_stats::MediaStatsCell::default();
+        install_media_connected_hook(
+            &registry,
+            &MediaSessionKey::builder()
+                .call_id("MEDIA-PHASE".into())
+                .generation(current)
+                .build(),
+            &stats,
+        );
+        stats.notify_media_connected();
+        assert_eq!(
+            registry.phase_if_current("MEDIA-PHASE", current),
+            Some(CallPhase::Active)
+        );
+        registry.remove_if_current("MEDIA-PHASE", current);
+        let replacement = registry.insert(session());
+        stats.notify_media_connected();
+        assert_eq!(
+            registry.phase_if_current("MEDIA-PHASE", replacement),
+            Some(CallPhase::Calling)
+        );
+        assert_eq!(
+            Arc::strong_count(&registry),
+            1,
+            "hooks keep only weak registry references"
+        );
+    }
+
+    #[test]
+    fn incoming_connected_hook_respects_teardown() {
+        use wacore::voip_control::registry::CallRegistry;
+        use wacore::voip_control::{CallPhase, CallSession};
+        let registry = Arc::new(CallRegistry::new());
+        let generation = registry.insert(CallSession::new_incoming(
+            "INCOMING-PHASE",
+            wacore_binary::Jid::new("2", wacore_binary::Server::Lid),
+            wacore_binary::Jid::new("2", wacore_binary::Server::Lid),
+        ));
+        let stats = wacore::voip_control::media_stats::MediaStatsCell::default();
+        install_media_connected_hook(
+            &registry,
+            &MediaSessionKey::builder()
+                .call_id("INCOMING-PHASE".into())
+                .generation(generation)
+                .build(),
+            &stats,
+        );
+        stats.notify_media_connected();
+        assert_eq!(
+            registry.phase_if_current("INCOMING-PHASE", generation),
+            Some(CallPhase::Active)
+        );
+        registry.remove_if_current("INCOMING-PHASE", generation);
+        stats.notify_media_connected();
+        assert_eq!(
+            registry.phase_if_current("INCOMING-PHASE", generation),
+            None
+        );
+    }
 
     fn spec() -> MediaSessionSpec {
         MediaSessionSpec::builder()
