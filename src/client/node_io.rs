@@ -645,6 +645,19 @@ impl Client {
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
+        // A claimed group notification still owes an ACK, so persistence must
+        // precede both interceptors and the built-in group effects.
+        let group_capture_generation = if tag == Some(StanzaTag::Notification) {
+            match crate::handlers::notification::NotificationHandler::capture_group(self, &node)
+                .await
+            {
+                Ok(generation) => generation,
+                Err(()) => return,
+            }
+        } else {
+            None
+        };
+
         // An interceptor runs before the built-in pipeline so a consumer can
         // act on a stanza this version does not model, instead of watching it
         // get nacked.
@@ -673,9 +686,19 @@ impl Client {
                     && nr.get_attr("from").is_some())
                 .then(|| Arc::clone(&node))
             });
-            if let Some(node) = ack {
+            if let Some(node) = ack
+                && group_capture_generation.is_none_or(|generation| {
+                    self.connection_generation.load(Ordering::Acquire) == generation
+                })
+            {
                 self.maybe_deferred_ack(node).await;
             }
+            return;
+        }
+
+        if group_capture_generation.is_some_and(|generation| {
+            self.connection_generation.load(Ordering::Acquire) != generation
+        }) {
             return;
         }
 
@@ -706,6 +729,9 @@ impl Client {
                 )
                 .await;
             }
+            Some(StanzaTag::Notification) => {
+                crate::handlers::notification::handle_notification_impl(self, node).await;
+            }
             _ => {
                 let handled = self
                     .stanza_router
@@ -722,7 +748,12 @@ impl Client {
             }
         }
 
-        if !cancelled && let Some(node) = deferred_ack_node {
+        if !cancelled
+            && group_capture_generation.is_none_or(|generation| {
+                self.connection_generation.load(Ordering::Acquire) == generation
+            })
+            && let Some(node) = deferred_ack_node
+        {
             self.maybe_deferred_ack(node).await;
         }
     }

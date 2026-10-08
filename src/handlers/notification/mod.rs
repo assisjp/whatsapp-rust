@@ -31,20 +31,51 @@ impl StanzaHandler for NotificationHandler {
         node: Arc<OwnedNodeRef>,
         cancelled: &mut bool,
     ) -> bool {
-        // The async trait already returns a boxed future; only configured group
-        // capture should allocate or await an additional future.
-        if let Some(hook) = client.group_notification_durability_hook.get()
-            && node.get().attrs().optional_string("type").as_deref()
-                == Some(NotificationType::WGp2.as_str())
-            && hook.on_notification(Arc::clone(&node)).await.is_err()
-        {
-            // Claim the stanza while withholding effects and the generic ACK/NACK.
+        if Self::capture_group(&client, &node).await.is_err() {
             *cancelled = true;
-            log::warn!("Group notification capture failed; ACK withheld");
             return true;
         }
         handle_notification_impl(&client, node).await;
         true
+    }
+}
+
+impl NotificationHandler {
+    /// The node dispatcher calls this before interceptors; direct router
+    /// callers enter through `handle` instead. Neither path captures twice.
+    pub(crate) async fn capture_group(
+        client: &Client,
+        node: &Arc<OwnedNodeRef>,
+    ) -> Result<Option<u64>, ()> {
+        let Some(hook) = client.group_notification_durability_hook.get() else {
+            return Ok(None);
+        };
+        if node.get().attrs().optional_string("type").as_deref()
+            != Some(NotificationType::WGp2.as_str())
+        {
+            return Ok(None);
+        }
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if hook.on_notification(Arc::clone(node)).await.is_err() {
+            log::warn!("Group notification capture failed; ACK withheld");
+            return Err(());
+        }
+        // Capture can outlive the socket that received this envelope. Its
+        // durable record remains useful, but old effects must not mutate the
+        // replacement connection or ACK its notification queue.
+        if client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            debug!(
+                "Group notification capture completed on a retired connection; effects withheld"
+            );
+            return Err(());
+        }
+        Ok(Some(generation))
     }
 }
 
@@ -65,7 +96,7 @@ impl StanzaHandler for NotificationHandler {
     feature = "tracing",
     tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
 )]
-async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+pub(crate) async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 

@@ -4,8 +4,8 @@ use wacore_binary::OwnedNodeRef;
 
 /// A durable gate for each complete inbound `notification type="w:gp2"` stanza.
 ///
-/// Awaited once, before group cache changes, sender-key rotation, typed group
-/// events, and the generic transport ACK. `Ok(())` means the entire original
+/// Awaited once, before stanza interceptors, group cache changes, sender-key
+/// rotation, typed group events, and the generic transport ACK. `Ok(())` means the entire original
 /// notification (all actions) has committed. `Err` prevents those effects and
 /// cancels the ACK; the stanza remains handled, without an unknown-stanza NACK.
 /// No hook preserves existing processing. This also gates `groups_dirty` and
@@ -25,6 +25,8 @@ use wacore_binary::OwnedNodeRef;
 /// must atomically persist raw evidence and an outbox, be idempotent, and return
 /// only after durable commit. This hook does not replay local effects or make
 /// detached/ordered event delivery durable; drive downstream work from outbox.
+/// If the connection is retired while capture is pending, the completed
+/// commit is retained by the host but stale effects and ACK are withheld.
 /// RawNode diagnostic observers may run before this gate. Do not treat those
 /// observers or the typed event stream as the durable source.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]

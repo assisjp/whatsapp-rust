@@ -337,3 +337,225 @@ async fn canceled_pending_capture_has_no_group_effects_or_wire_ack() {
     assert_eq!(group_events(&collector), 0);
     assert!(transport.sent().is_empty());
 }
+
+async fn claimed_notification_waits_for_capture(fail: bool) {
+    use crate::client::interceptor::Interception;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (client, transport) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    let hook = Arc::new(RecordingHook::new(fail));
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _interceptor = client.add_stanza_interceptor(Arc::new({
+        let calls = calls.clone();
+        move |_node: &OwnedNodeRef| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Interception::Handled
+        }
+    }));
+    let task = tokio::spawn({
+        let client = client.clone();
+        async move { client.process_node(multi_action_node()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "interceptors wait for durable capture"
+    );
+    assert!(transport.sent().is_empty());
+    hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hook.nodes.lock().unwrap().len(), 1);
+    assert_eq!(
+        group_events(&collector),
+        0,
+        "a claim skips built-in effects"
+    );
+    if fail {
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            transport.sent().is_empty(),
+            "a failed capture cannot be ACKed by a claim"
+        );
+    } else {
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while transport.sent().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        assert_eq!(plaintexts.len(), 1);
+        let unpacked = wacore_binary::util::unpack(&plaintexts[0]).unwrap();
+        let ack = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+        assert_eq!(ack.tag(), "ack");
+        assert_eq!(
+            ack.get().attrs().optional_string("id").as_deref(),
+            Some("group-durability-1")
+        );
+    }
+}
+
+#[tokio::test]
+async fn interceptor_claim_cannot_bypass_failed_group_capture() {
+    claimed_notification_waits_for_capture(true).await;
+}
+
+#[tokio::test]
+async fn interceptor_claim_ack_follows_successful_group_capture() {
+    claimed_notification_waits_for_capture(false).await;
+}
+
+#[tokio::test]
+async fn passing_interceptor_does_not_capture_the_same_group_envelope_twice() {
+    use crate::client::interceptor::Interception;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (client, _) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _interceptor = client.add_stanza_interceptor(Arc::new({
+        let calls = calls.clone();
+        move |_node: &OwnedNodeRef| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Interception::Pass
+        }
+    }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.process_node(multi_action_node()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.nodes.lock().unwrap().len(), 1);
+    assert_eq!(group_events(&collector), 2);
+}
+
+#[tokio::test]
+async fn reconnect_during_group_capture_withholds_stale_effects_interceptors_and_ack() {
+    use crate::client::interceptor::Interception;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for claim in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+        client
+            .set_sender_key_status_for_devices(GROUP, &[participant], true, false)
+            .await
+            .unwrap();
+        let before = client
+            .persistence_manager
+            .get_sender_key_devices(GROUP)
+            .await
+            .unwrap();
+        assert!(!before.is_empty());
+        let hook = Arc::new(RecordingHook::new(false));
+        assert!(
+            client
+                .group_notification_durability_hook
+                .set(hook.clone())
+                .is_ok()
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _interceptor = client.add_stanza_interceptor(Arc::new({
+            let calls = calls.clone();
+            move |_node: &OwnedNodeRef| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if claim {
+                    Interception::Handled
+                } else {
+                    Interception::Pass
+                }
+            }
+        }));
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.process_node(multi_action_node()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
+            .await
+            .unwrap();
+        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        hook.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hook.nodes.lock().unwrap().len(),
+            1,
+            "the durable commit still happened"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(group_events(&collector), 0);
+        assert!(transport.sent().is_empty());
+        let after = client
+            .persistence_manager
+            .get_sender_key_devices(GROUP)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "old modify cannot clear current sender-key state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interceptor_retiring_connection_after_capture_does_not_ack_old_notification() {
+    use crate::client::interceptor::Interception;
+    use std::sync::atomic::Ordering;
+
+    let (client, transport) = create_iq_test_client().await;
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let _interceptor = client.add_stanza_interceptor(Arc::new({
+        let generation = client.connection_generation.clone();
+        move |_node: &OwnedNodeRef| {
+            generation.fetch_add(1, Ordering::AcqRel);
+            Interception::Handled
+        }
+    }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.process_node(multi_action_node()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hook.nodes.lock().unwrap().len(), 1);
+    assert!(transport.sent().is_empty());
+}
