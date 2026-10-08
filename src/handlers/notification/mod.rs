@@ -29,8 +29,20 @@ impl StanzaHandler for NotificationHandler {
         &self,
         client: Arc<Client>,
         node: Arc<OwnedNodeRef>,
-        _cancelled: &mut bool,
+        cancelled: &mut bool,
     ) -> bool {
+        // The async trait already returns a boxed future; only configured group
+        // capture should allocate or await an additional future.
+        if let Some(hook) = client.group_notification_durability_hook.get()
+            && node.get().attrs().optional_string("type").as_deref()
+                == Some(NotificationType::WGp2.as_str())
+            && hook.on_notification(Arc::clone(&node)).await.is_err()
+        {
+            // Claim the stanza while withholding effects and the generic ACK/NACK.
+            *cancelled = true;
+            log::warn!("Group notification capture failed; ACK withheld");
+            return true;
+        }
         handle_notification_impl(&client, node).await;
         true
     }
@@ -137,6 +149,8 @@ use groups::*;
 use privacy_business::*;
 use profile::*;
 
+#[cfg(test)]
+mod durability_tests;
 #[cfg(test)]
 mod reachout_tests;
 
