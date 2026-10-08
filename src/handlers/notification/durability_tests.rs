@@ -17,6 +17,8 @@ struct RecordingHook {
 }
 
 impl RecordingHook {
+    /// Hold capture at an explicit barrier, then choose commit success or
+    /// failure without depending on socket timing or a real storage backend.
     fn new(fail: bool) -> Self {
         Self {
             nodes: Mutex::new(Vec::new()),
@@ -40,6 +42,8 @@ impl GroupNotificationDurabilityHook for RecordingHook {
     }
 }
 
+/// One wire envelope with a sender-key invalidation and a visible rename:
+/// capture must retain both before either independent effect becomes visible.
 fn multi_action_node() -> Arc<OwnedNodeRef> {
     node_to_owned_ref(
         &NodeBuilder::new("notification")
@@ -338,6 +342,8 @@ async fn canceled_pending_capture_has_no_group_effects_or_wire_ack() {
     assert!(transport.sent().is_empty());
 }
 
+/// Exercise the claim path through the real dispatcher and encrypted wire
+/// transport so an early or missing ACK cannot hide behind a handler mock.
 async fn claimed_notification_waits_for_capture(fail: bool) {
     use crate::client::interceptor::Interception;
     use std::sync::atomic::{AtomicUsize, Ordering};

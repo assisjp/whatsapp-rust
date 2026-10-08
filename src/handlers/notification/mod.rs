@@ -82,9 +82,9 @@ impl NotificationHandler {
 /// Dispatch notification by type.
 ///
 /// Every asynchronous arm is `Box::pin`ned. Awaiting a plain async fn inlines
-/// its state machine into this one, and `async_trait` boxes *this* future on
-/// every inbound `<notification>` — so without the indirection that one
-/// allocation is sized for the union of all the arms, and a
+/// its state machine into this one, retained by both the node dispatcher and
+/// the boxed router handler. Without the indirection their futures carry the
+/// union of all the arms, and a
 /// `<notification type="picture">` pays for `handle_devices_notification`'s
 /// locals. Measured on `benches/inbound_stanza`, a `<notification
 /// type="picture">` allocated 2306 bytes before — of which a single 2272-byte

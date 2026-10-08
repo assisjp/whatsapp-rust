@@ -32,5 +32,11 @@ use wacore_binary::OwnedNodeRef;
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait GroupNotificationDurabilityHook: wacore::sync_marker::MaybeSendSync {
+    /// Commit the full envelope before returning `Ok(())` to admit processing.
+    ///
+    /// Return an error when the host cannot establish a durable commit. A
+    /// successful return does not promise effects or an ACK: the connection
+    /// may have retired while this future was pending. Implementations must
+    /// therefore publish downstream work atomically with their durable record.
     async fn on_notification(&self, node: Arc<OwnedNodeRef>) -> Result<()>;
 }
