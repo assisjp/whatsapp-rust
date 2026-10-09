@@ -463,11 +463,11 @@ async fn passing_interceptor_does_not_capture_the_same_group_envelope_twice() {
 }
 
 #[tokio::test]
-async fn reconnect_during_group_capture_withholds_stale_effects_interceptors_and_ack() {
+async fn retirement_during_group_capture_withholds_stale_effects_interceptors_and_ack() {
     use crate::client::interceptor::Interception;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for claim in [false, true] {
+    for (claim, shutdown_only) in [(false, false), (true, false), (false, true), (true, true)] {
         let (client, transport) = create_iq_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
@@ -508,7 +508,16 @@ async fn reconnect_during_group_capture_withholds_stale_effects_interceptors_and
         tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
             .await
             .unwrap();
-        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        if shutdown_only {
+            let generation = client.connection_generation.load(Ordering::Acquire);
+            client.notify_connection_shutdown();
+            assert_eq!(
+                client.connection_generation.load(Ordering::Acquire),
+                generation
+            );
+        } else {
+            client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        }
         hook.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

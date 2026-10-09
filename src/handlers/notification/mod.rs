@@ -31,11 +31,16 @@ impl StanzaHandler for NotificationHandler {
         node: Arc<OwnedNodeRef>,
         cancelled: &mut bool,
     ) -> bool {
-        if Self::capture_group(&client, &node).await.is_err() {
+        let shutdown = client.connection_shutdown_signal();
+        if shutdown.is_fired()
+            || Self::capture_group(&client, &node, &shutdown)
+                .await
+                .is_err()
+        {
             *cancelled = true;
             return true;
         }
-        handle_notification_impl(&client, node).await;
+        Self::handle_scoped(&client, node, &shutdown).await;
         true
     }
 }
@@ -46,6 +51,7 @@ impl NotificationHandler {
     pub(crate) async fn capture_group(
         client: &Client,
         node: &Arc<OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
     ) -> Result<Option<u64>, ()> {
         let Some(hook) = client.group_notification_durability_hook.get() else {
             return Ok(None);
@@ -65,10 +71,11 @@ impl NotificationHandler {
         // Capture can outlive the socket that received this envelope. Its
         // durable record remains useful, but old effects must not mutate the
         // replacement connection or ACK its notification queue.
-        if client
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != generation
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
         {
             debug!(
                 "Group notification capture completed on a retired connection; effects withheld"
@@ -77,6 +84,21 @@ impl NotificationHandler {
         }
         Ok(Some(generation))
     }
+    pub(crate) async fn handle_scoped(
+        client: &Arc<Client>,
+        node: Arc<OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) {
+        if !shutdown.is_fired() {
+            handle_notification_scoped(client, node, shutdown).await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+    let shutdown = client.connection_shutdown_signal();
+    handle_notification_scoped(client, node, &shutdown).await;
 }
 
 /// Dispatch notification by type.
@@ -96,7 +118,11 @@ impl NotificationHandler {
     feature = "tracing",
     tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
 )]
-pub(crate) async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+async fn handle_notification_scoped(
+    client: &Arc<Client>,
+    node: Arc<OwnedNodeRef>,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
@@ -112,7 +138,10 @@ pub(crate) async fn handle_notification_impl(client: &Arc<Client>, node: Arc<Own
         }
         Some(NotificationType::Devices) => Box::pin(handle_devices_notification(client, nr)).await,
         Some(NotificationType::LinkCodeCompanionReg) => {
-            Box::pin(crate::pair_code::handle_pair_code_notification(client, nr)).await;
+            Box::pin(crate::pair_code::handle_pair_code_notification_scoped(
+                client, nr, shutdown,
+            ))
+            .await;
         }
         Some(NotificationType::CompanionRegRefresh) => {
             Box::pin(handle_companion_reg_refresh(client, nr)).await
