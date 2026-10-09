@@ -24,6 +24,8 @@ mod lifecycle;
 pub(crate) mod member_index;
 mod messaging;
 mod node_io;
+mod notification_scope;
+pub(crate) use notification_scope::NotificationScope;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;

@@ -10,6 +10,10 @@ use wacore_binary::OwnedNodeRef;
 /// cancels the ACK; the stanza remains handled, without an unknown-stanza NACK.
 /// No hook preserves existing processing. This also gates `groups_dirty` and
 /// malformed/unknown group actions so the raw envelope is not lost by parsing.
+/// With a hook, transport admissions for the same group share its inbound
+/// message lane through capture and effects. Other groups and transport
+/// responses remain independent. Do not wait inside the hook for a later
+/// inbound message or notification on that same group lane.
 ///
 /// Persist `node.backing_bytes()` verbatim: unpacked decoded node bytes, not a
 /// network frame, JSON, re-encoded node, or serialized `GroupUpdate`. Compute a
@@ -27,6 +31,8 @@ use wacore_binary::OwnedNodeRef;
 /// detached/ordered event delivery durable; drive downstream work from outbox.
 /// If the connection is retired while capture is pending, the completed
 /// commit is retained by the host but stale effects and ACK are withheld.
+/// Shutdown may cancel the callback; treat cancellation as an indeterminate
+/// commit and reconcile persisted evidence before retrying.
 /// RawNode diagnostic observers may run before this gate. Do not treat those
 /// observers or the typed event stream as the durable source.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]

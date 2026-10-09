@@ -158,7 +158,18 @@ async fn handle_notification_scoped(
             Box::pin(handle_contacts_notification(client, nr)).await
         }
         Some(NotificationType::WGp2) => {
-            Box::pin(handle_group_notification(client, Arc::clone(&node))).await
+            let scope = crate::client::NotificationScope::new(
+                client
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                shutdown,
+            );
+            scope
+                .run(
+                    client,
+                    Box::pin(handle_group_notification(client, Arc::clone(&node), scope)),
+                )
+                .await;
         }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)

@@ -9,6 +9,239 @@ use wacore_binary::{Jid, OwnedNodeRef, builder::NodeBuilder};
 
 const GROUP: &str = "120363000000000000@g.us";
 
+struct FirstCaptureBarrier {
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl GroupNotificationDurabilityHook for FirstCaptureBarrier {
+    async fn on_notification(&self, node: Arc<OwnedNodeRef>) -> anyhow::Result<()> {
+        if node.get().attrs().optional_string("id").as_deref() == Some("first") {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
+fn participant_notification(id: &str, action: &'static str) -> OwnedNodeRef {
+    participant_notification_for(GROUP, id, action)
+}
+
+fn participant_notification_for(group: &str, id: &str, action: &'static str) -> OwnedNodeRef {
+    Arc::try_unwrap(node_to_owned_ref(
+        &NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", group)
+            .attr("id", id)
+            .attr("offline", "1")
+            .children([NodeBuilder::new(action)
+                .children([NodeBuilder::new("participant")
+                    .attr("jid", "12025550102@s.whatsapp.net")
+                    .build()])
+                .build()])
+            .build(),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn queued_group_capture_keeps_remove_then_add_in_arrival_order() {
+    use std::sync::atomic::Ordering;
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+
+    let (client, _) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    client
+        .offline_sync_metrics
+        .active
+        .store(true, Ordering::Release);
+    client
+        .offline_sync_metrics
+        .total_messages
+        .store(3, Ordering::Release);
+    let group: Jid = GROUP.parse().unwrap();
+    let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+    client
+        .get_group_cache()
+        .insert(
+            group.clone(),
+            Arc::new(GroupRoutingInfo::new(
+                vec![participant.clone()],
+                AddressingMode::Pn,
+            )),
+        )
+        .await;
+    let hook = Arc::new(FirstCaptureBarrier {
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    assert!(client.processes_inline(participant_notification("first", "remove").get()));
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .process_decrypted_node(participant_notification("first", "remove"))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
+        .await
+        .unwrap();
+    client
+        .process_decrypted_node(participant_notification_for(
+            "120363000000000099@g.us",
+            "other-group",
+            "add",
+        ))
+        .await;
+    crate::test_utils::poll_until("unrelated group makes progress during capture", || {
+        group_events(&collector) == 1
+    })
+    .await;
+    client
+        .process_decrypted_node(participant_notification("second", "add"))
+        .await;
+    assert_eq!(
+        client
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire),
+        3,
+        "arrival accounting must not wait behind durable capture"
+    );
+    hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap();
+    crate::test_utils::poll_until("all group effects", || group_events(&collector) == 3).await;
+    let ids: Vec<_> = collector
+        .events()
+        .iter()
+        .filter_map(|event| match &**event {
+            Event::GroupUpdate(update) if update.group_jid == group => {
+                update.notification_id.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["first", "second"]);
+    let info = client.get_group_cache().get(&group).await.unwrap();
+    assert_eq!(info.participants, [participant]);
+    assert_eq!(
+        client
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire),
+        3,
+        "the worker must not account for an arrival twice"
+    );
+}
+
+#[tokio::test]
+async fn retirement_while_waiting_for_group_metadata_preserves_current_state() {
+    use std::sync::atomic::Ordering;
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+
+    for shutdown_only in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let group: Jid = GROUP.parse().unwrap();
+        let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+        let snapshot = Arc::new(GroupRoutingInfo::new(
+            vec![participant.clone()],
+            AddressingMode::Pn,
+        ));
+        client
+            .get_group_cache()
+            .insert(group.clone(), snapshot.clone())
+            .await;
+        client
+            .set_sender_key_status_for_devices(GROUP, &[participant], true, false)
+            .await
+            .unwrap();
+        let metadata = client.lock_group_metadata(&group).await;
+        let lock = client.group_distribution_locks.get(&group).await.unwrap();
+        let baseline = Arc::strong_count(&lock);
+        let hook = Arc::new(RecordingHook::new(false));
+        hook.release.notify_one();
+        assert!(client.group_notification_durability_hook.set(hook).is_ok());
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.process_node(multi_action_node()).await }
+        });
+        crate::test_utils::wait_for_lock_waiter(&lock, baseline).await;
+        if shutdown_only {
+            client.notify_connection_shutdown();
+        } else {
+            client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(metadata);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = client
+            .get_group_cache()
+            .get(&group)
+            .await
+            .expect("retired handler must not invalidate current routing");
+        assert!(Arc::ptr_eq(&current, &snapshot));
+        assert!(
+            !client
+                .persistence_manager
+                .get_sender_key_devices(GROUP)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(group_events(&collector), 0);
+        assert!(transport.sent().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn retirement_from_group_event_stops_remaining_actions_and_ack() {
+    struct Retire(Arc<crate::Client>);
+    impl wacore::types::events::EventHandler for Retire {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::GroupUpdate(_)) {
+                self.0
+                    .connection_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+    let (client, transport) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    let _collector = client.subscribe_handler(collector.clone());
+    let _retire = client.subscribe_handler(Arc::new(Retire(client.clone())));
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(client.group_notification_durability_hook.set(hook).is_ok());
+    client.process_node(multi_action_node()).await;
+    assert_eq!(group_events(&collector), 1);
+    assert!(
+        !collector
+            .events()
+            .iter()
+            .any(|event| matches!(&**event, Event::Notification(_)))
+    );
+    assert!(transport.sent().is_empty());
+}
+
 struct RecordingHook {
     nodes: Mutex<Vec<Arc<OwnedNodeRef>>>,
     entered: Notify,
