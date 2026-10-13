@@ -497,8 +497,13 @@ impl Client {
     ) -> wacore::runtime::BoxFuture<'_, ()> {
         Box::pin(async move {
             if NotificationScope::new(generation, &shutdown).is_current(self) {
-                self.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Notification))
-                    .await;
+                self.dispatch_node_scoped(
+                    node,
+                    &shutdown,
+                    Some(StanzaTag::Notification),
+                    generation,
+                )
+                .await;
             }
         })
     }
@@ -521,14 +526,14 @@ impl Client {
         shutdown: &wacore::runtime::ShutdownSignal,
         enqueue_group: bool,
     ) {
+        let generation = self.connection_generation.load(Ordering::Acquire);
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
         // Classified once; every gate below dispatches on the enum instead of
         // re-comparing the tag string.
         let tag = StanzaTag::try_from(nr.tag.as_ref()).ok();
-        let group_scope = (enqueue_group && self.queues_group_notification(nr)).then(|| {
-            NotificationScope::new(self.connection_generation.load(Ordering::Acquire), shutdown)
-        });
+        let group_scope = (enqueue_group && self.queues_group_notification(nr))
+            .then(|| NotificationScope::new(generation, shutdown));
 
         // --- Offline Sync Tracking ---
         if tag == Some(StanzaTag::InfoBanner) {
@@ -701,7 +706,8 @@ impl Client {
                 .await;
             return;
         }
-        self.dispatch_node_scoped(node, shutdown, tag).await;
+        self.dispatch_node_scoped(node, shutdown, tag, generation)
+            .await;
     }
 
     async fn dispatch_node_scoped(
@@ -709,6 +715,7 @@ impl Client {
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
         tag: Option<StanzaTag>,
+        generation: u64,
     ) {
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
@@ -728,7 +735,7 @@ impl Client {
         // precede both interceptors and the built-in group effects.
         let group_capture_generation = if tag == Some(StanzaTag::Notification) {
             match crate::handlers::notification::NotificationHandler::capture_group(
-                self, &node, shutdown,
+                self, &node, shutdown, generation,
             )
             .await
             {
@@ -794,12 +801,9 @@ impl Client {
                 .await;
             }
             Some(StanzaTag::Notification) => {
-                Box::pin(
+                cancelled |= !Box::pin(
                     crate::handlers::notification::NotificationHandler::handle_scoped(
-                        self,
-                        node,
-                        shutdown,
-                        group_capture_generation,
+                        self, node, shutdown, generation,
                     ),
                 )
                 .await;

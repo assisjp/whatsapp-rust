@@ -1025,20 +1025,166 @@ async fn captured_generation_is_preserved_when_success_retires_it_without_shutdo
     assert!(client.group_notification_durability_hook.set(hook).is_ok());
     let shutdown = client.connection_shutdown_signal();
     let node = multi_action_node();
-    let captured = NotificationHandler::capture_group(&client, &node, &shutdown)
-        .await
-        .unwrap();
+    let captured = NotificationHandler::capture_group(
+        &client,
+        &node,
+        &shutdown,
+        client.connection_generation.load(Ordering::Acquire),
+    )
+    .await
+    .unwrap();
     assert!(captured.is_some());
     client.connection_generation.fetch_add(1, Ordering::AcqRel);
     assert!(
         !shutdown.is_fired(),
         "success can advance generation on the same socket"
     );
-    NotificationHandler::handle_scoped(&client, node, &shutdown, captured).await;
+    NotificationHandler::handle_scoped(&client, node, &shutdown, captured.unwrap()).await;
     assert_eq!(
         group_events(&collector),
         0,
         "effects must use the capture generation"
+    );
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn admitted_key_retirement_does_not_wait_for_the_offline_message_permit() {
+    use wacore::libsignal::protocol::SenderKeyRecord;
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
+    let (client, _) = create_iq_test_client().await;
+    let own: Jid = "888000888000888:3@lid".parse().unwrap();
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            own.clone(),
+        )))
+        .await;
+    let group: Jid = GROUP.parse().unwrap();
+    let name = SenderKeyName::from_parts(GROUP, own.to_protocol_address().as_str());
+    let record = SenderKeyRecord::new_empty();
+    let backend = client.persistence_manager.backend();
+    backend
+        .put_sender_key(name.cache_key(), &record.serialize().unwrap())
+        .await
+        .unwrap();
+    client.signal_cache.put_sender_key(&name, record).await;
+    client.enter_drain_mode_for_tests();
+    let permit = client.acquire_message_processing_permit().await;
+    let metadata = client.lock_group_metadata(&group).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        metadata.force_rotate_own_sender_key(),
+    )
+    .await
+    .expect("own-key retirement must not wait for a message holder that can need this group lock")
+    .expect("own-key retirement must commit");
+    assert!(
+        backend
+            .get_sender_key(name.cache_key())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(metadata);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn sender_key_storage_error_withholds_group_events_and_ack() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use wacore::libsignal::protocol::SenderKeyRecord;
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    probe.fail_after_method = Some("delete_sender_key");
+    let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    let lid: Jid = "888000888000888:3@lid".parse().unwrap();
+    let pn: Jid = "12025550101:3@s.whatsapp.net".parse().unwrap();
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            lid.clone(),
+        )))
+        .await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+            pn.clone(),
+        )))
+        .await;
+    let mut names = Vec::new();
+    for own in [lid, pn] {
+        let name = SenderKeyName::from_parts(GROUP, own.to_protocol_address().as_str());
+        let record = SenderKeyRecord::new_empty();
+        raw.put_sender_key(name.cache_key(), &record.serialize().unwrap())
+            .await
+            .unwrap();
+        client.signal_cache.put_sender_key(&name, record).await;
+        names.push(name);
+    }
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    client.process_node(multi_action_node()).await;
+    assert_eq!(
+        hook.nodes.lock().unwrap().len(),
+        1,
+        "raw capture succeeded before key storage failed"
+    );
+    for name in names {
+        assert!(
+            raw.get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "both deletes must be attempted despite one error"
+        );
+    }
+    assert_eq!(group_events(&collector), 0);
+    assert!(
+        transport.sent().is_empty(),
+        "an indeterminate key retirement must not be ACKed"
+    );
+}
+
+#[tokio::test]
+async fn capture_rejects_enqueue_generation_retired_before_shutdown_fires() {
+    use std::sync::atomic::Ordering;
+    let (client, transport) = create_iq_test_client().await;
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let shutdown = client.connection_shutdown_signal();
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    assert!(
+        !shutdown.is_fired(),
+        "cleanup can advance generation before firing shutdown"
+    );
+    assert!(
+        NotificationHandler::capture_group(&client, &multi_action_node(), &shutdown, generation)
+            .await
+            .is_err()
+    );
+    assert!(
+        hook.nodes.lock().unwrap().is_empty(),
+        "an old queued envelope must not be labeled with the new generation"
     );
     assert!(transport.sent().is_empty());
 }

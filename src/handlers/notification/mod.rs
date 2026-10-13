@@ -31,19 +31,19 @@ impl StanzaHandler for NotificationHandler {
         node: Arc<OwnedNodeRef>,
         cancelled: &mut bool,
     ) -> bool {
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let shutdown = client.connection_shutdown_signal();
-        if shutdown.is_fired() {
+        if shutdown.is_fired()
+            || Self::capture_group(&client, &node, &shutdown, generation)
+                .await
+                .is_err()
+        {
             *cancelled = true;
             return true;
         }
-        let captured_generation = match Self::capture_group(&client, &node, &shutdown).await {
-            Ok(generation) => generation,
-            Err(()) => {
-                *cancelled = true;
-                return true;
-            }
-        };
-        Self::handle_scoped(&client, node, &shutdown, captured_generation).await;
+        *cancelled |= !Self::handle_scoped(&client, node, &shutdown, generation).await;
         true
     }
 }
@@ -55,6 +55,7 @@ impl NotificationHandler {
         client: &Client,
         node: &Arc<OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
+        generation: u64,
     ) -> Result<Option<u64>, ()> {
         let Some(hook) = client.group_notification_durability_hook.get() else {
             return Ok(None);
@@ -64,9 +65,6 @@ impl NotificationHandler {
         {
             return Ok(None);
         }
-        let generation = client
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
         let scope = crate::client::NotificationScope::new(generation, shutdown);
         let Some(result) = scope
             .run(client, hook.on_notification(Arc::clone(node)))
@@ -98,10 +96,12 @@ impl NotificationHandler {
         client: &Arc<Client>,
         node: Arc<OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
-        captured_generation: Option<u64>,
-    ) {
-        if !shutdown.is_fired() {
-            handle_notification_scoped(client, node, shutdown, captured_generation).await;
+        generation: u64,
+    ) -> bool {
+        if shutdown.is_fired() {
+            false
+        } else {
+            handle_notification_scoped(client, node, shutdown, generation).await
         }
     }
 }
@@ -109,7 +109,15 @@ impl NotificationHandler {
 #[cfg(test)]
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let shutdown = client.connection_shutdown_signal();
-    handle_notification_scoped(client, node, &shutdown, None).await;
+    handle_notification_scoped(
+        client,
+        node,
+        &shutdown,
+        client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire),
+    )
+    .await;
 }
 
 /// Dispatch notification by type.
@@ -133,8 +141,8 @@ async fn handle_notification_scoped(
     client: &Arc<Client>,
     node: Arc<OwnedNodeRef>,
     shutdown: &wacore::runtime::ShutdownSignal,
-    captured_generation: Option<u64>,
-) {
+    generation: u64,
+) -> bool {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
@@ -170,15 +178,8 @@ async fn handle_notification_scoped(
             Box::pin(handle_contacts_notification(client, nr)).await
         }
         Some(NotificationType::WGp2) => {
-            let scope = crate::client::NotificationScope::new(
-                captured_generation.unwrap_or_else(|| {
-                    client
-                        .connection_generation
-                        .load(std::sync::atomic::Ordering::Acquire)
-                }),
-                shutdown,
-            );
-            Box::pin(handle_group_notification(client, Arc::clone(&node), scope)).await;
+            let scope = crate::client::NotificationScope::new(generation, shutdown);
+            return Box::pin(handle_group_notification(client, Arc::clone(&node), scope)).await;
         }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)
@@ -203,7 +204,7 @@ async fn handle_notification_scoped(
                 ))
                 .await
             {
-                return;
+                return true;
             }
             let other = notification_type.as_deref().unwrap_or_default();
             debug!("Unhandled notification type '{other}', dispatching raw event");
@@ -213,6 +214,7 @@ async fn handle_notification_scoped(
                 .dispatch(Event::Notification(Arc::clone(&node)));
         }
     }
+    true
 }
 
 mod companion_reg;

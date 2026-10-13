@@ -33,7 +33,8 @@ use wacore_binary::OwnedNodeRef;
 /// and ACK. A host commit that already completed remains the host's responsibility.
 /// Once a metadata change starts, connection retirement lets storage/cache
 /// publication and required sender-key rotation for both identities finish
-/// under its group lock, then stops later actions and ACK.
+/// under its group lock, then stops later actions and ACK. A sender-key
+/// storage error also withholds later events and ACK, and needs reconciliation.
 /// If the callback is canceled, treat cancellation as an indeterminate
 /// commit and reconcile persisted evidence before retrying.
 /// RawNode diagnostic observers may run before this gate. Do not treat those

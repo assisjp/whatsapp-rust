@@ -1238,16 +1238,19 @@ impl GroupMetadataGuard<'_> {
             .await;
     }
 
-    pub(crate) async fn rotate_sender_key_on_participant_remove(&self, users: &[&str]) {
+    pub(crate) async fn rotate_sender_key_on_participant_remove(
+        &self,
+        users: &[&str],
+    ) -> anyhow::Result<()> {
         self.client
             .rotate_sender_key_on_participant_remove_locked(self.jid, users)
-            .await;
+            .await
     }
 
-    pub(crate) async fn force_rotate_own_sender_key(&self) {
+    pub(crate) async fn force_rotate_own_sender_key(&self) -> anyhow::Result<()> {
         self.client
             .force_rotate_own_sender_key_locked(self.jid)
-            .await;
+            .await
     }
 
     pub(crate) async fn publish(&self, info: Arc<GroupRoutingInfo>) {

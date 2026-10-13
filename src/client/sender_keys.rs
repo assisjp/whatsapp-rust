@@ -190,8 +190,12 @@ impl Client {
             return;
         }
 
-        self.rotate_sender_key_on_participant_remove_locked(group_jid, removed_user_ids)
-            .await;
+        if let Err(error) = self
+            .rotate_sender_key_on_participant_remove_locked(group_jid, removed_user_ids)
+            .await
+        {
+            log::warn!("Failed to retire group sender keys for {group_jid}: {error}");
+        }
         drop(distribution_guard);
     }
 
@@ -201,9 +205,9 @@ impl Client {
         &self,
         group_jid: &Jid,
         removed_user_ids: &[&str],
-    ) {
+    ) -> Result<()> {
         if removed_user_ids.is_empty() {
-            return;
+            return Ok(());
         }
         let group_id = group_jid.to_string();
         // Read failure → rotate anyway. Better to pay the redistribute cost
@@ -231,12 +235,10 @@ impl Client {
                     .is_some_and(|jid| removed_user_ids.iter().any(|u| *u == jid.user.as_str()))
         });
         if !read_failed && !any_had_key {
-            return;
+            return Ok(());
         }
 
-        self.rotate_own_sender_key_state(&group_id).await;
-        self.flush_signal_cache_batch_safe_logged("rotate_on_participant_remove", None)
-            .await;
+        self.rotate_own_sender_key_state(&group_id).await
     }
 
     /// Unconditional forward-secrecy rotation: delete the bot's own sender key
@@ -278,32 +280,42 @@ impl Client {
         if scope.is_some_and(|scope| !scope.is_current(self)) {
             return;
         }
-        self.force_rotate_own_sender_key_locked(group_jid).await;
+        if let Err(error) = self.force_rotate_own_sender_key_locked(group_jid).await {
+            log::warn!("Failed to retire group sender keys for {group_jid}: {error}");
+        }
         drop(distribution_guard);
     }
 
-    pub(crate) async fn force_rotate_own_sender_key_locked(&self, group_jid: &Jid) {
+    pub(crate) async fn force_rotate_own_sender_key_locked(&self, group_jid: &Jid) -> Result<()> {
         self.rotate_own_sender_key_state(&group_jid.to_string())
-            .await;
-        self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
-            .await;
+            .await
     }
 
-    /// Once admitted under the group lock, retire both identities and their
-    /// delivery marks even if the connection retires between storage awaits.
-    async fn rotate_own_sender_key_state(&self, group_id: &str) {
+    /// Retire only these outbound chains. A global flush would take the drain's
+    /// message permit while this caller holds the group lock, which a message
+    /// holder can itself need. It would also flush unrelated inbound state.
+    async fn rotate_own_sender_key_state(&self, group_id: &str) -> Result<()> {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
+        let backend = self.persistence_manager.backend();
+        let mut failure = None;
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
-            let sk_name =
-                SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
-            self.signal_cache
-                .delete_sender_key(sk_name.cache_key())
-                .await;
+            let name = SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
+            if let Err(error) = self
+                .signal_cache
+                .delete_sender_key_durable(&name, backend.as_ref())
+                .await
+            {
+                failure.get_or_insert(error);
+            }
         }
-        if let Err(e) = self.reset_sender_key_device_tracking(group_id).await {
-            log::warn!("rotate_own_sender_key_state: reset failed for {group_id}: {e}");
+        if let Err(error) = self.reset_sender_key_device_tracking(group_id).await {
+            failure.get_or_insert(error);
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

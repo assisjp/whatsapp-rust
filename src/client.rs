@@ -481,7 +481,7 @@ pub(crate) struct ChatLane {
 }
 
 impl ChatLane {
-    #[cfg(any(test, feature = "bench-harness"))]
+    #[cfg(test)]
     pub(crate) fn try_enqueue(
         &self,
         node: Arc<wacore_binary::OwnedNodeRef>,
