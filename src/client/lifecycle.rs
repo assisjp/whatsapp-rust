@@ -2092,7 +2092,8 @@ impl Client {
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
-        let outcome = self.cleanup_connection_state_inner().await;
+        // Keep cold teardown layout out of downstream operation futures.
+        let outcome = Box::pin(self.cleanup_connection_state_inner()).await;
         self.clear_connection_scoped_pair_code().await;
         outcome
     }
@@ -2119,7 +2120,8 @@ impl Client {
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
         if self.lifecycle.is_none() {
-            let outcome = self.cleanup_connection_state_inner().await;
+            // Keep cold teardown layout out of downstream operation futures.
+            let outcome = Box::pin(self.cleanup_connection_state_inner()).await;
             self.clear_connection_scoped_pair_code().await;
             return outcome;
         }

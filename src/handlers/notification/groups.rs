@@ -187,8 +187,16 @@ pub(crate) async fn handle_group_notification(
         // group metadata IQ round-trip.
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
-                if let Some(info) = metadata.current().await {
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return;
+                };
+                let Some(current) = scope.run(client, metadata.current()).await else {
+                    return;
+                };
+                if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
                         participants
@@ -213,8 +221,16 @@ pub(crate) async fn handle_group_notification(
             }
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
-                if let Some(info) = metadata.current().await {
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return;
+                };
+                let Some(current) = scope.run(client, metadata.current()).await else {
+                    return;
+                };
+                if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
                     metadata.publish_scoped(Arc::new(info), Some(scope)).await;
@@ -256,7 +272,12 @@ pub(crate) async fn handle_group_notification(
                     "Group modify (number/LID migration) for {}: invalidating metadata and rotating sender key",
                     notification.group_jid.observe()
                 );
-                let metadata = client.lock_group_metadata(&notification.group_jid).await;
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return;
+                };
                 metadata.invalidate_scoped(Some(scope)).await;
                 drop(metadata);
                 client

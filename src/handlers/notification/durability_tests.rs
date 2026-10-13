@@ -759,7 +759,7 @@ async fn retirement_during_group_capture_withholds_stale_effects_interceptors_an
         assert_eq!(
             hook.nodes.lock().unwrap().len(),
             1,
-            "the durable commit still happened"
+            "the original envelope reached capture once"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(group_events(&collector), 0);
@@ -806,4 +806,135 @@ async fn interceptor_retiring_connection_after_capture_does_not_ack_old_notifica
     .unwrap();
     assert_eq!(hook.nodes.lock().unwrap().len(), 1);
     assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn retired_queued_notification_keeps_enqueue_time_shutdown_after_reset() {
+    use std::sync::atomic::Ordering;
+    let (client, transport) = create_iq_test_client().await;
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let shutdown = client.connection_shutdown_signal();
+    client.notify_connection_shutdown();
+    client.reset_connection_shutdown();
+    assert_eq!(
+        client.connection_generation.load(Ordering::Acquire),
+        generation
+    );
+    client
+        .process_queued_group_notification(multi_action_node(), generation, shutdown)
+        .await;
+    assert!(hook.nodes.lock().unwrap().is_empty());
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn metadata_commit_finishes_cache_publication_after_retirement() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+    for shutdown_only in [false, true] {
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        probe.gate_method = "after:put_group_metadata";
+        probe.entered = Some(entered_tx);
+        probe.gate = Some(release_rx);
+        let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let group: Jid = GROUP.parse().unwrap();
+        let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+        client
+            .get_group_cache()
+            .insert(
+                group.clone(),
+                Arc::new(GroupRoutingInfo::new(vec![participant], AddressingMode::Pn)),
+            )
+            .await;
+        let hook = Arc::new(RecordingHook::new(false));
+        hook.release.notify_one();
+        assert!(client.group_notification_durability_hook.set(hook).is_ok());
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .process_node(Arc::new(participant_notification(
+                        "remove-commit",
+                        "remove",
+                    )))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: GroupRoutingInfo =
+            serde_json::from_slice(&raw.get_group_metadata(GROUP).await.unwrap().unwrap()).unwrap();
+        assert!(
+            stored.participants.is_empty(),
+            "storage committed before retirement"
+        );
+        if shutdown_only {
+            client.notify_connection_shutdown();
+        } else {
+            client
+                .connection_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        release_tx.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            client
+                .get_group_cache()
+                .get(&group)
+                .await
+                .unwrap()
+                .participants
+                .is_empty(),
+            "routing must agree with the completed storage removal"
+        );
+        assert_eq!(group_events(&collector), 0);
+        assert!(transport.sent().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn redelivery_recaptures_original_bytes_and_repeats_non_durable_events() {
+    let (client, _) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    let hook = Arc::new(RecordingHook::new(false));
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(hook.clone())
+            .is_ok()
+    );
+    let node = multi_action_node();
+    for _ in 0..2 {
+        hook.release.notify_one();
+        client.process_node(node.clone()).await;
+    }
+    let records = hook.nodes.lock().unwrap();
+    assert_eq!(records.len(), 2, "host idempotence must handle redelivery");
+    assert_eq!(records[0].backing_bytes(), records[1].backing_bytes());
+    assert_eq!(
+        group_events(&collector),
+        4,
+        "typed events are not an exactly-once outbox"
+    );
 }

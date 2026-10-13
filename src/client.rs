@@ -481,18 +481,29 @@ pub(crate) struct ChatLane {
 }
 
 impl ChatLane {
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) fn try_enqueue(
         &self,
         node: Arc<wacore_binary::OwnedNodeRef>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        self.try_enqueue_scoped(node, wacore::runtime::ShutdownSignal::never())
+    }
+
+    pub(crate) fn try_enqueue_scoped(
+        &self,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        shutdown: wacore::runtime::ShutdownSignal,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         self.queue_tx.try_send(QueuedChatMessage {
             node,
+            shutdown,
             lane_liveness: Arc::clone(&self.enqueue_lock),
         })
     }
 }
 
 pub(crate) struct QueuedChatMessage {
+    pub shutdown: wacore::runtime::ShutdownSignal,
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
 }

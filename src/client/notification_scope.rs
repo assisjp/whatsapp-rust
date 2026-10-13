@@ -21,13 +21,18 @@ impl<'a> NotificationScope<'a> {
         }
     }
 
+    pub(crate) fn shutdown(self) -> ShutdownSignal {
+        self.shutdown.clone()
+    }
+
     pub(crate) fn is_current(self, client: &Client) -> bool {
         !self.shutdown.is_fired()
             && client.connection_generation.load(Ordering::Acquire) == self.generation
     }
 
-    /// A task parked on a group lock or storage must not resume into a new
-    /// connection. Subscribe to shutdown so even an idle wait is cancelled.
+    /// Cancel admission waits, reads and host capture on connection retirement.
+    /// Already-started mutations must finish their storage/cache commit without
+    /// this wrapper; dropping them can leave routing inconsistent with storage.
     pub(crate) async fn run<F: Future>(self, client: &Client, future: F) -> Option<F::Output> {
         let mut future = pin!(future);
         let mut shutdown = pin!(wait_for_shutdown(self.shutdown));

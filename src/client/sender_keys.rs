@@ -176,7 +176,17 @@ impl Client {
             return;
         }
         let group_id = group_jid.to_string();
-        let distribution_guard = self.group_distribution_lock(group_jid).await;
+        let distribution_guard = if let Some(scope) = scope {
+            let Some(guard) = scope
+                .run(self, self.group_distribution_lock(group_jid))
+                .await
+            else {
+                return;
+            };
+            guard
+        } else {
+            self.group_distribution_lock(group_jid).await
+        };
         if scope.is_some_and(|scope| !scope.is_current(self)) {
             return;
         }
@@ -243,7 +253,17 @@ impl Client {
         scope: Option<super::NotificationScope<'_>>,
     ) {
         let group_id = group_jid.to_string();
-        let distribution_guard = self.group_distribution_lock(group_jid).await;
+        let distribution_guard = if let Some(scope) = scope {
+            let Some(guard) = scope
+                .run(self, self.group_distribution_lock(group_jid))
+                .await
+            else {
+                return;
+            };
+            guard
+        } else {
+            self.group_distribution_lock(group_jid).await
+        };
         self.rotate_own_sender_key_state(&group_id, scope).await;
         drop(distribution_guard);
 
@@ -264,19 +284,22 @@ impl Client {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
+        let mut deleted_any = false;
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
             if scope.is_some_and(|scope| !scope.is_current(self)) {
-                return;
+                break;
             }
             let sk_name =
                 SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
             self.signal_cache
                 .delete_sender_key(sk_name.cache_key())
                 .await;
+            deleted_any = true;
         }
 
+        let reset_scope = if deleted_any { None } else { scope };
         if let Err(e) = self
-            .reset_sender_key_device_tracking_scoped(group_id, scope)
+            .reset_sender_key_device_tracking_scoped(group_id, reset_scope)
             .await
         {
             log::warn!("rotate_own_sender_key_state: reset failed for {group_id}: {e}");
@@ -966,6 +989,96 @@ mod tests {
             map.generation(),
             gen_before,
             "excluding all named devices leaves the map untouched"
+        );
+    }
+    #[tokio::test]
+    async fn completed_sender_key_deletion_resets_tracking_after_retirement() {
+        use std::sync::atomic::Ordering;
+        use wacore::libsignal::protocol::SenderKeyRecord;
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        let pn: Jid = "12025550101:3@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                lid.clone(),
+            )))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                pn.clone(),
+            )))
+            .await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group_id = group.to_string();
+        let member: Jid = "12025550102:0@s.whatsapp.net".parse().unwrap();
+        client
+            .set_sender_key_status_for_devices(&group_id, &[member], true, false)
+            .await
+            .unwrap();
+        let pn_key = SenderKeyName::from_parts(&group_id, pn.to_protocol_address().as_str());
+        let lid_key = SenderKeyName::from_parts(&group_id, lid.to_protocol_address().as_str());
+        client
+            .signal_cache
+            .put_sender_key(&lid_key, SenderKeyRecord::new_empty())
+            .await;
+        client
+            .signal_cache
+            .put_sender_key(&pn_key, SenderKeyRecord::new_empty())
+            .await;
+        let lock = client.signal_cache.sender_key_lock(&lid_key).await;
+        let guard = lock.lock().await;
+        let baseline = Arc::strong_count(&lock);
+        let task = tokio::spawn({
+            let client = client.clone();
+            let group = group.clone();
+            async move {
+                let shutdown = client.connection_shutdown_signal();
+                let scope = super::super::NotificationScope::new(
+                    client.connection_generation.load(Ordering::Acquire),
+                    &shutdown,
+                );
+                client
+                    .force_rotate_own_sender_key_scoped(&group, Some(scope))
+                    .await;
+            }
+        });
+        crate::test_utils::wait_for_lock_waiter(&lock, baseline).await;
+        client.notify_connection_shutdown();
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&lid_key, &*backend)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&pn_key, &*backend)
+                .await
+                .unwrap()
+                .is_some(),
+            "the second identity was skipped after retirement"
+        );
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(&group_id)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().all(|(_, has_key)| !has_key),
+            "completed deletion requires fresh SKDM even after retirement"
         );
     }
 }

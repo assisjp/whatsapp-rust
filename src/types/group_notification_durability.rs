@@ -29,9 +29,11 @@ use wacore_binary::OwnedNodeRef;
 /// must atomically persist raw evidence and an outbox, be idempotent, and return
 /// only after durable commit. This hook does not replay local effects or make
 /// detached/ordered event delivery durable; drive downstream work from outbox.
-/// If the connection is retired while capture is pending, the completed
-/// commit is retained by the host but stale effects and ACK are withheld.
-/// Shutdown may cancel the callback; treat cancellation as an indeterminate
+/// Reconnect or shutdown can cancel a pending callback and withhold effects
+/// and ACK. A host commit that already completed remains the host's responsibility.
+/// Once a metadata change starts, connection retirement lets storage/cache
+/// publication finish under its group lock, then stops later actions and ACK.
+/// If the callback is canceled, treat cancellation as an indeterminate
 /// commit and reconcile persisted evidence before retrying.
 /// RawNode diagnostic observers may run before this gate. Do not treat those
 /// observers or the typed event stream as the durable source.

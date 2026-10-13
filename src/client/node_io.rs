@@ -493,15 +493,13 @@ impl Client {
         self: &Arc<Self>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         generation: u64,
+        shutdown: wacore::runtime::ShutdownSignal,
     ) -> wacore::runtime::BoxFuture<'_, ()> {
         Box::pin(async move {
-            let shutdown = self.connection_shutdown_signal();
-            NotificationScope::new(generation, &shutdown)
-                .run(
-                    self,
-                    self.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Notification)),
-                )
-                .await;
+            if NotificationScope::new(generation, &shutdown).is_current(self) {
+                self.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Notification))
+                    .await;
+            }
         })
     }
 

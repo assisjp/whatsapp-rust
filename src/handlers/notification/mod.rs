@@ -64,7 +64,14 @@ impl NotificationHandler {
         let generation = client
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        if hook.on_notification(Arc::clone(node)).await.is_err() {
+        let scope = crate::client::NotificationScope::new(generation, shutdown);
+        let Some(result) = scope
+            .run(client, hook.on_notification(Arc::clone(node)))
+            .await
+        else {
+            return Err(());
+        };
+        if result.is_err() {
             log::warn!("Group notification capture failed; ACK withheld");
             return Err(());
         }
@@ -164,12 +171,7 @@ async fn handle_notification_scoped(
                     .load(std::sync::atomic::Ordering::Acquire),
                 shutdown,
             );
-            scope
-                .run(
-                    client,
-                    Box::pin(handle_group_notification(client, Arc::clone(&node), scope)),
-                )
-                .await;
+            Box::pin(handle_group_notification(client, Arc::clone(&node), scope)).await;
         }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)
