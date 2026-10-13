@@ -32,7 +32,8 @@ use wacore_binary::OwnedNodeRef;
 /// Reconnect or shutdown can cancel a pending callback and withhold effects
 /// and ACK. A host commit that already completed remains the host's responsibility.
 /// Once a metadata change starts, connection retirement lets storage/cache
-/// publication finish under its group lock, then stops later actions and ACK.
+/// publication and required sender-key rotation for both identities finish
+/// under its group lock, then stops later actions and ACK.
 /// If the callback is canceled, treat cancellation as an indeterminate
 /// commit and reconcile persisted evidence before retrying.
 /// RawNode diagnostic observers may run before this gate. Do not treat those

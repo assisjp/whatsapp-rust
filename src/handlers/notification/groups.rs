@@ -230,10 +230,13 @@ pub(crate) async fn handle_group_notification(
                 let Some(current) = scope.run(client, metadata.current()).await else {
                     return;
                 };
+                if !scope.is_current(client) {
+                    return;
+                }
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
-                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
+                    metadata.publish(Arc::new(info)).await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
@@ -246,15 +249,10 @@ pub(crate) async fn handle_group_notification(
                         "Group cache expired for {}: invalidating persisted metadata (remove)",
                         notification.group_jid.observe()
                     );
-                    metadata.invalidate_scoped(Some(scope)).await;
+                    metadata.invalidate().await;
                 }
-                drop(metadata);
-                client
-                    .rotate_sender_key_on_participant_remove_scoped(
-                        &notification.group_jid,
-                        &users,
-                        Some(scope),
-                    )
+                metadata
+                    .rotate_sender_key_on_participant_remove(&users)
                     .await;
             }
             GroupNotificationAction::Modify { .. } => {
@@ -278,11 +276,11 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return;
                 };
-                metadata.invalidate_scoped(Some(scope)).await;
-                drop(metadata);
-                client
-                    .force_rotate_own_sender_key_scoped(&notification.group_jid, Some(scope))
-                    .await;
+                if !scope.is_current(client) {
+                    return;
+                }
+                metadata.invalidate().await;
+                metadata.force_rotate_own_sender_key().await;
             }
             _ => {}
         }

@@ -27,6 +27,7 @@ pub(crate) struct ProbeBackend {
     pub(crate) gate: Option<async_channel::Receiver<()>>,
     pub(crate) entered: Option<async_channel::Sender<()>>,
     pub(crate) gate_method: &'static str,
+    pub(crate) fail_after_method: Option<&'static str>,
     fail_save: bool,
     pub(crate) fail_maintenance: bool,
 }
@@ -44,6 +45,7 @@ impl ProbeBackend {
                 gate: None,
                 entered: None,
                 gate_method: "save",
+                fail_after_method: None,
                 fail_save: false,
                 fail_maintenance: false,
             },

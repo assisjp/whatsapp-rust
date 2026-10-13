@@ -175,7 +175,6 @@ impl Client {
         if removed_user_ids.is_empty() {
             return;
         }
-        let group_id = group_jid.to_string();
         let distribution_guard = if let Some(scope) = scope {
             let Some(guard) = scope
                 .run(self, self.group_distribution_lock(group_jid))
@@ -191,6 +190,22 @@ impl Client {
             return;
         }
 
+        self.rotate_sender_key_on_participant_remove_locked(group_jid, removed_user_ids)
+            .await;
+        drop(distribution_guard);
+    }
+
+    /// Caller holds the group's metadata/distribution lock. Once admitted,
+    /// membership and both identities' key retirement are one transition.
+    pub(crate) async fn rotate_sender_key_on_participant_remove_locked(
+        &self,
+        group_jid: &Jid,
+        removed_user_ids: &[&str],
+    ) {
+        if removed_user_ids.is_empty() {
+            return;
+        }
+        let group_id = group_jid.to_string();
         // Read failure → rotate anyway. Better to pay the redistribute cost
         // than leave the sender key in place after a removal we couldn't audit.
         let (rows, read_failed) = match self
@@ -219,11 +234,7 @@ impl Client {
             return;
         }
 
-        self.rotate_own_sender_key_state(&group_id, scope).await;
-        drop(distribution_guard);
-        if scope.is_some_and(|scope| !scope.is_current(self)) {
-            return;
-        }
+        self.rotate_own_sender_key_state(&group_id).await;
         self.flush_signal_cache_batch_safe_logged("rotate_on_participant_remove", None)
             .await;
     }
@@ -239,6 +250,7 @@ impl Client {
             .await;
     }
 
+    #[cfg(test)]
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -252,7 +264,6 @@ impl Client {
         group_jid: &Jid,
         scope: Option<super::NotificationScope<'_>>,
     ) {
-        let group_id = group_jid.to_string();
         let distribution_guard = if let Some(scope) = scope {
             let Some(guard) = scope
                 .run(self, self.group_distribution_lock(group_jid))
@@ -264,44 +275,34 @@ impl Client {
         } else {
             self.group_distribution_lock(group_jid).await
         };
-        self.rotate_own_sender_key_state(&group_id, scope).await;
-        drop(distribution_guard);
-
         if scope.is_some_and(|scope| !scope.is_current(self)) {
             return;
         }
+        self.force_rotate_own_sender_key_locked(group_jid).await;
+        drop(distribution_guard);
+    }
 
+    pub(crate) async fn force_rotate_own_sender_key_locked(&self, group_jid: &Jid) {
+        self.rotate_own_sender_key_state(&group_jid.to_string())
+            .await;
         self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
             .await;
     }
 
-    /// A send must not publish a new distribution between the audit and reset.
-    async fn rotate_own_sender_key_state(
-        &self,
-        group_id: &str,
-        scope: Option<super::NotificationScope<'_>>,
-    ) {
+    /// Once admitted under the group lock, retire both identities and their
+    /// delivery marks even if the connection retires between storage awaits.
+    async fn rotate_own_sender_key_state(&self, group_id: &str) {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
-        let mut deleted_any = false;
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
-            if scope.is_some_and(|scope| !scope.is_current(self)) {
-                break;
-            }
             let sk_name =
                 SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
             self.signal_cache
                 .delete_sender_key(sk_name.cache_key())
                 .await;
-            deleted_any = true;
         }
-
-        let reset_scope = if deleted_any { None } else { scope };
-        if let Err(e) = self
-            .reset_sender_key_device_tracking_scoped(group_id, reset_scope)
-            .await
-        {
+        if let Err(e) = self.reset_sender_key_device_tracking(group_id).await {
             log::warn!("rotate_own_sender_key_state: reset failed for {group_id}: {e}");
         }
     }
@@ -1068,8 +1069,8 @@ mod tests {
                 .get_sender_key(&pn_key, &*backend)
                 .await
                 .unwrap()
-                .is_some(),
-            "the second identity was skipped after retirement"
+                .is_none(),
+            "retirement must not leave a surviving PN sender key"
         );
         let rows = client
             .persistence_manager

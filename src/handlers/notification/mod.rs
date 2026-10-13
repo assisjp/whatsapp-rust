@@ -32,15 +32,18 @@ impl StanzaHandler for NotificationHandler {
         cancelled: &mut bool,
     ) -> bool {
         let shutdown = client.connection_shutdown_signal();
-        if shutdown.is_fired()
-            || Self::capture_group(&client, &node, &shutdown)
-                .await
-                .is_err()
-        {
+        if shutdown.is_fired() {
             *cancelled = true;
             return true;
         }
-        Self::handle_scoped(&client, node, &shutdown).await;
+        let captured_generation = match Self::capture_group(&client, &node, &shutdown).await {
+            Ok(generation) => generation,
+            Err(()) => {
+                *cancelled = true;
+                return true;
+            }
+        };
+        Self::handle_scoped(&client, node, &shutdown, captured_generation).await;
         true
     }
 }
@@ -95,9 +98,10 @@ impl NotificationHandler {
         client: &Arc<Client>,
         node: Arc<OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
+        captured_generation: Option<u64>,
     ) {
         if !shutdown.is_fired() {
-            handle_notification_scoped(client, node, shutdown).await;
+            handle_notification_scoped(client, node, shutdown, captured_generation).await;
         }
     }
 }
@@ -105,7 +109,7 @@ impl NotificationHandler {
 #[cfg(test)]
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let shutdown = client.connection_shutdown_signal();
-    handle_notification_scoped(client, node, &shutdown).await;
+    handle_notification_scoped(client, node, &shutdown, None).await;
 }
 
 /// Dispatch notification by type.
@@ -129,6 +133,7 @@ async fn handle_notification_scoped(
     client: &Arc<Client>,
     node: Arc<OwnedNodeRef>,
     shutdown: &wacore::runtime::ShutdownSignal,
+    captured_generation: Option<u64>,
 ) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
@@ -166,9 +171,11 @@ async fn handle_notification_scoped(
         }
         Some(NotificationType::WGp2) => {
             let scope = crate::client::NotificationScope::new(
-                client
-                    .connection_generation
-                    .load(std::sync::atomic::Ordering::Acquire),
+                captured_generation.unwrap_or_else(|| {
+                    client
+                        .connection_generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                }),
                 shutdown,
             );
             Box::pin(handle_group_notification(client, Arc::clone(&node), scope)).await;

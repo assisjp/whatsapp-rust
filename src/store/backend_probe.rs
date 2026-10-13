@@ -19,6 +19,9 @@ macro_rules! forward_methods {
                 self.before_call(stringify!($method)).await;
                 let result = self.backend.$method($($arg),*).await;
                 self.before_call(concat!("after:", stringify!($method))).await;
+                if self.fail_after_method == Some(stringify!($method)) {
+                    return Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure after commit")));
+                }
                 result
             })
         })+

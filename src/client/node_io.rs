@@ -796,7 +796,10 @@ impl Client {
             Some(StanzaTag::Notification) => {
                 Box::pin(
                     crate::handlers::notification::NotificationHandler::handle_scoped(
-                        self, node, shutdown,
+                        self,
+                        node,
+                        shutdown,
+                        group_capture_generation,
                     ),
                 )
                 .await;

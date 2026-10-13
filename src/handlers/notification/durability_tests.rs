@@ -840,13 +840,21 @@ async fn metadata_commit_finishes_cache_publication_after_retirement() {
     use crate::store::release::tests::ProbeBackend;
     use crate::test_utils::create_iq_test_client_with_backend;
     use wacore::client::context::GroupRoutingInfo;
+    use wacore::libsignal::protocol::{
+        KeyPair, SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord,
+    };
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
     use wacore::types::message::AddressingMode;
-    for shutdown_only in [false, true] {
+    for (shutdown_only, fail_response) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let (mut probe, _) = ProbeBackend::new();
         let raw = probe.backend.clone();
         let (entered_tx, entered_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
         probe.gate_method = "after:put_group_metadata";
+        probe.fail_after_method = fail_response.then_some("put_group_metadata");
         probe.entered = Some(entered_tx);
         probe.gate = Some(release_rx);
         let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
@@ -858,9 +866,52 @@ async fn metadata_commit_finishes_cache_publication_after_retirement() {
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupRoutingInfo::new(vec![participant], AddressingMode::Pn)),
+                Arc::new(GroupRoutingInfo::new(
+                    vec![participant.clone()],
+                    AddressingMode::Pn,
+                )),
             )
             .await;
+        let own_lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        let own_pn: Jid = "12025550101:3@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                own_pn.clone(),
+            )))
+            .await;
+        client
+            .set_sender_key_status_for_devices(GROUP, &[participant], true, false)
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        for own in [own_lid, own_pn] {
+            let name = SenderKeyName::from_parts(GROUP, own.to_protocol_address().as_str());
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let key_pair = KeyPair::generate(&mut rng);
+            let mut record = SenderKeyRecord::new_empty();
+            record
+                .add_sender_key_state(
+                    SENDERKEY_MESSAGE_CURRENT_VERSION,
+                    7,
+                    0,
+                    &[9; 32],
+                    key_pair.public_key,
+                    Some(key_pair.private_key),
+                )
+                .unwrap();
+            raw.put_sender_key(name.cache_key(), &record.serialize().unwrap())
+                .await
+                .unwrap();
+            client.signal_cache.put_sender_key(&name, record).await;
+            names.push(name);
+        }
         let hook = Arc::new(RecordingHook::new(false));
         hook.release.notify_one();
         assert!(client.group_notification_durability_hook.set(hook).is_ok());
@@ -907,6 +958,30 @@ async fn metadata_commit_finishes_cache_publication_after_retirement() {
                 .is_empty(),
             "routing must agree with the completed storage removal"
         );
+        for name in names {
+            assert!(
+                raw.get_sender_key(name.cache_key())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "retired removal must durably delete both own identities"
+            );
+            assert!(
+                client
+                    .signal_cache
+                    .get_sender_key(&name, &*raw)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            raw.get_sender_key_devices(GROUP)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, warm)| !warm)
+        );
         assert_eq!(group_events(&collector), 0);
         assert!(transport.sent().is_empty());
     }
@@ -937,4 +1012,33 @@ async fn redelivery_recaptures_original_bytes_and_repeats_non_durable_events() {
         4,
         "typed events are not an exactly-once outbox"
     );
+}
+
+#[tokio::test]
+async fn captured_generation_is_preserved_when_success_retires_it_without_shutdown() {
+    use std::sync::atomic::Ordering;
+    let (client, transport) = create_iq_test_client().await;
+    let collector = Arc::new(TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+    let hook = Arc::new(RecordingHook::new(false));
+    hook.release.notify_one();
+    assert!(client.group_notification_durability_hook.set(hook).is_ok());
+    let shutdown = client.connection_shutdown_signal();
+    let node = multi_action_node();
+    let captured = NotificationHandler::capture_group(&client, &node, &shutdown)
+        .await
+        .unwrap();
+    assert!(captured.is_some());
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    assert!(
+        !shutdown.is_fired(),
+        "success can advance generation on the same socket"
+    );
+    NotificationHandler::handle_scoped(&client, node, &shutdown, captured).await;
+    assert_eq!(
+        group_events(&collector),
+        0,
+        "effects must use the capture generation"
+    );
+    assert!(transport.sent().is_empty());
 }
