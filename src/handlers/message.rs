@@ -745,7 +745,8 @@ mod tests {
     #[tokio::test]
     async fn slow_group_capture_reports_lane_delay() {
         use crate::test_utils::log_capture;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         const TEST: &str = "handlers::message::tests::slow_group_capture_reports_lane_delay";
         if log_capture::delegated_to_child(TEST) {
             return;
