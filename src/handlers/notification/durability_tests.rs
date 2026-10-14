@@ -1188,3 +1188,83 @@ async fn capture_rejects_enqueue_generation_retired_before_shutdown_fires() {
     );
     assert!(transport.sent().is_empty());
 }
+
+#[tokio::test]
+async fn failed_key_delete_preserves_remove_retry_admission() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wacore::libsignal::protocol::SenderKeyRecord;
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
+
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let failing = Arc::new(AtomicBool::new(true));
+    probe.fail_before_method = Some(("delete_sender_key", failing.clone()));
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let own: Jid = "888000888000888:3@lid".parse().unwrap();
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            own.clone(),
+        )))
+        .await;
+    let name = SenderKeyName::from_parts(GROUP, own.to_protocol_address().as_str());
+    let record = SenderKeyRecord::new_empty();
+    raw.put_sender_key(name.cache_key(), &record.serialize().unwrap())
+        .await
+        .unwrap();
+    client.signal_cache.put_sender_key(&name, record).await;
+    let participant: Jid = "12025550102:0@s.whatsapp.net".parse().unwrap();
+    client
+        .set_sender_key_status_for_devices(GROUP, &[participant], true, false)
+        .await
+        .unwrap();
+    let group = GROUP.parse().unwrap();
+    let guard = client.lock_group_metadata(&group).await;
+    assert!(
+        guard
+            .rotate_sender_key_on_participant_remove(&["12025550102"])
+            .await
+            .is_err()
+    );
+    assert!(
+        raw.get_sender_key(name.cache_key())
+            .await
+            .unwrap()
+            .is_some(),
+        "delete failed before commit"
+    );
+    assert!(
+        client
+            .persistence_manager
+            .get_sender_key_devices(GROUP)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, warm)| *warm),
+        "failed delete must remain eligible for remove retry"
+    );
+    failing.store(false, Ordering::Relaxed);
+    guard
+        .rotate_sender_key_on_participant_remove(&["12025550102"])
+        .await
+        .unwrap();
+    assert!(
+        raw.get_sender_key(name.cache_key())
+            .await
+            .unwrap()
+            .is_none(),
+        "redelivery must retry persisted deletion despite cached tombstone"
+    );
+    assert!(
+        client
+            .persistence_manager
+            .get_sender_key_devices(GROUP)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, warm)| !warm)
+    );
+}

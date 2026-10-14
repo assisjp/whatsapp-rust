@@ -310,12 +310,12 @@ impl Client {
                 failure.get_or_insert(error);
             }
         }
-        if let Err(error) = self.reset_sender_key_device_tracking(group_id).await {
-            failure.get_or_insert(error);
-        }
+        // Keep warm rows until every deletion is confirmed. Otherwise a
+        // redelivered remove would see no recipient with the retired chain
+        // and skip retrying a backend deletion that may not have committed.
         match failure {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => self.reset_sender_key_device_tracking(group_id).await,
         }
     }
 

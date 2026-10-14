@@ -17,6 +17,12 @@ macro_rules! forward_methods {
         where $($lt: 'async_trait,)+ Self: 'async_trait {
             Box::pin(async move {
                 self.before_call(stringify!($method)).await;
+                if let Some((method, failing)) = &self.fail_before_method
+                    && *method == stringify!($method)
+                    && failing.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure before commit")));
+                }
                 let result = self.backend.$method($($arg),*).await;
                 self.before_call(concat!("after:", stringify!($method))).await;
                 if self.fail_after_method == Some(stringify!($method)) {
