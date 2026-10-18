@@ -119,6 +119,13 @@ impl StanzaHandler for CallHandler {
                             {
                                 return true;
                             }
+                            // Participant metadata is authoritative only inside this call's
+                            // service envelope, never on a peer-authored or foreign-call stanza.
+                            if call.participant.is_some()
+                                && !is_call_service_sender(&call.from, call.action.call_id())
+                            {
+                                return true;
+                            }
                             let Some(sender) = canonical_call_identity(
                                 &client,
                                 &routed_call_sender(&call),
@@ -533,13 +540,17 @@ impl StanzaHandler for CallHandler {
                             .maybe_audio_codec(audio_codec)
                             .build();
                         if let Some((generation, creator, device)) = direct_accept.as_ref() {
-                            if !client.call_registry().accept_direct_if_current(
-                                call.action.call_id(),
-                                *generation,
-                                creator,
-                                device.clone(),
-                                answer,
-                            ) {
+                            if !client
+                                .call_registry()
+                                .accept_direct_if_current(
+                                    call.action.call_id(),
+                                    *generation,
+                                    creator,
+                                    device.clone(),
+                                    answer,
+                                )
+                                .await
+                            {
                                 return true;
                             }
                         } else {
@@ -1610,7 +1621,11 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
 /// and the final `terminate` from it rather than from the creator's device.
 #[cfg(feature = "voip-control")]
 fn is_call_service_sender(sender: &Jid, call_id: &str) -> bool {
-    sender.server == Server::Call && sender.device == 0 && sender.user.as_str() == call_id
+    sender.server == Server::Call
+        && sender.device == 0
+        && sender.agent == 0
+        && sender.integrator == 0
+        && sender.user.as_str() == call_id
 }
 
 #[cfg(feature = "voip-control")]
@@ -1927,6 +1942,61 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_participant_requires_its_own_call_service_envelope() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let (_, generation) = register_native_opus_call(&client, Vec::new());
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let rekey = client
+            .call_registry()
+            .resident_session("CALL-ID-0001", generation)
+            .unwrap()
+            .take_rekey_receiver()
+            .unwrap();
+        for sender in [
+            Jid::new("222222222222222", Server::Lid),
+            fake_caller_lid(),
+            Jid::new("OTHER-CALL", Server::Call),
+            Jid::new("CALL-ID-0001", Server::Call).with_device(4),
+            Jid {
+                agent: 1,
+                ..Jid::new("CALL-ID-0001", Server::Call)
+            },
+            Jid {
+                integrator: 1,
+                ..Jid::new("CALL-ID-0001", Server::Call)
+            },
+        ] {
+            let accept = NodeBuilder::new("call")
+                .attr("from", sender)
+                .attr("participant", fake_caller_lid().with_device(4))
+                .attr("id", "FORGED-ROUTED-ACCEPT")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("accept")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("call-id", "CALL-ID-0001")
+                    .build()])
+                .build();
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                    .await
+            );
+            assert!(rekey.try_recv().is_err());
+            assert!(events.try_recv().is_err());
+            assert!(
+                client
+                    .call_registry()
+                    .answering_device_if_current("CALL-ID-0001", generation)
+                    .is_none()
+            );
+        }
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "voip-control")]
