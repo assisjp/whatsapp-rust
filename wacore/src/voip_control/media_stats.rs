@@ -74,17 +74,17 @@ impl MediaStatsCell {
         *self.connected.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
     }
 
-    /// Commit accepted media readiness before attempting public event delivery. Calling twice
-    /// is harmless, and the hook runs outside the cell lock so registry teardown cannot deadlock.
-    pub fn notify_media_connected(&self) {
+    /// Commit accepted media readiness before attempting public event delivery. The driver calls
+    /// this once per engine. A false result suppresses the public event for a rejected generation.
+    /// Without a hook a standalone engine may publish normally. The hook runs outside the cell
+    /// lock so registry teardown cannot deadlock.
+    pub fn notify_media_connected(&self) -> bool {
         let hook = self
             .connected
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
-        if let Some(hook) = hook {
-            hook();
-        }
+        hook.is_none_or(|hook| hook())
     }
 }
 

@@ -320,7 +320,6 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
     if matches!(
         &event,
         CallEvent::RelayAllocated
-            | CallEvent::MediaConnected
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
@@ -331,6 +330,27 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
     } else {
         events.try_send(event).is_ok()
     }
+}
+
+/// Keep the one-shot readiness notification pending when the public queue is full. In particular,
+/// it must not evict RelayAllocated from a single-slot queue. The snapshot is already committed;
+/// this bounded retry does not block media or allocate another queue.
+fn retry_media_connected_event(events: &async_channel::Sender<CallEvent>, pending: &mut bool) {
+    if *pending {
+        *pending = matches!(
+            events.try_send(CallEvent::MediaConnected),
+            Err(async_channel::TrySendError::Full(_))
+        );
+    }
+}
+
+fn queue_media_connected_event(
+    events: &async_channel::Sender<CallEvent>,
+    stats: &crate::voip::media_stats::MediaStatsCell,
+    pending: &mut bool,
+) {
+    *pending = stats.notify_media_connected();
+    retry_media_connected_event(events, pending);
 }
 
 /// Re-offer a keyframe request the consumer has not taken yet, clearing
@@ -793,6 +813,7 @@ async fn run_call_with_clock_and_wallclock(
     let mut send_keyframe_announced: Option<u64> = None;
     // A keyframe request a saturated consumer queue refused, retried below.
     let mut undelivered_keyframe_request = false;
+    let mut undelivered_media_connected = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -881,7 +902,12 @@ async fn run_call_with_clock_and_wallclock(
                     if matches!(ev, CallEvent::MediaConnected) {
                         // Commit lifecycle independently of a full public event queue. This is
                         // not another subscriber: Receiver clones compete for the same stream.
-                        channels.media_stats.notify_media_connected();
+                        queue_media_connected_event(
+                            &channels.events,
+                            &channels.media_stats,
+                            &mut undelivered_media_connected,
+                        );
+                        continue;
                     }
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
                     let delivered = publish_engine_event(&channels.events, ev);
@@ -961,6 +987,7 @@ async fn run_call_with_clock_and_wallclock(
         if eng.is_terminated() {
             break 'drive;
         }
+        retry_media_connected_event(&channels.events, &mut undelivered_media_connected);
 
         if let Some(endpoint) = reconnect_to {
             // An in-flight write belongs to the retired channel and is delivery-ambiguous. Drop it;
@@ -1748,6 +1775,34 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn readiness_waits_for_capacity_without_evicting_relay_allocation() {
+        let (tx, rx) = async_channel::bounded(1);
+        let stats = crate::voip::media_stats::MediaStatsCell::default();
+        assert!(publish_engine_event(&tx, CallEvent::RelayAllocated));
+        let mut pending = false;
+        queue_media_connected_event(&tx, &stats, &mut pending);
+        assert!(pending);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::RelayAllocated));
+        retry_media_connected_event(&tx, &mut pending);
+        assert!(!pending);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::MediaConnected));
+        retry_media_connected_event(&tx, &mut pending);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn rejected_readiness_never_enters_the_public_event_queue() {
+        let (tx, rx) = async_channel::bounded(1);
+        let stats = crate::voip::media_stats::MediaStatsCell::default();
+        stats.on_media_connected(Box::new(|| false));
+        let mut pending = false;
+        queue_media_connected_event(&tx, &stats, &mut pending);
+        assert!(!pending);
+        retry_media_connected_event(&tx, &mut pending);
+        assert!(rx.is_empty());
     }
 
     /// A refused request survives without displacing what the queue holds.
