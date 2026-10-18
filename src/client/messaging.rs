@@ -465,25 +465,6 @@ impl Client {
     }
 
     /// Register a oneshot waiter for a server ack by message ID.
-    /// Returns the receiver — caller sends the node separately and awaits this in background.
-    /// Sync: registration is just a `std::sync::Mutex` insert (no await).
-    /// Register a waiter that receives the ack node itself.
-    ///
-    /// VoIP reads the relay from its ACK. Group-history uses the guarded,
-    /// non-replacing variant below so concurrent retries cannot steal waiters.
-    /// A phash check does not need the node, which is why ordinary sends use
-    /// [`Self::register_phash_waiter`].
-    #[cfg(feature = "voip-control")]
-    pub(crate) fn register_ack_waiter(
-        &self,
-        message_id: &str,
-    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.response_waiters_guard()
-            .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
-        rx
-    }
-
     /// Register an ACK waiter only if this message ID is not already pending.
     /// Returns the entry generation so timeout cleanup cannot remove a newer
     /// waiter that reuses the same ID after this one was consumed.
