@@ -163,10 +163,12 @@ pub type VideoTeardownHook = Box<dyn Fn() + Send + Sync>;
 pub type VideoTeardownHook = Box<dyn Fn()>;
 
 /// One-shot direct media readiness callback: thread-safe on native, local on wasm32.
+/// Return false when this generation no longer accepts direct readiness; the backend must
+/// then suppress the public MediaConnected event as well as the retained snapshot.
 #[cfg(not(target_arch = "wasm32"))]
-pub type MediaConnectedHook = Box<dyn FnOnce() + Send + Sync>;
+pub type MediaConnectedHook = Box<dyn FnOnce() -> bool + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
-pub type MediaConnectedHook = Box<dyn FnOnce()>;
+pub type MediaConnectedHook = Box<dyn FnOnce() -> bool>;
 
 /// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder, so a later field does
 /// not break a backend that builds it.

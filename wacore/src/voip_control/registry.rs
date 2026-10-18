@@ -3146,9 +3146,9 @@ impl CallRegistry {
     ) -> super::MediaConnectedHook {
         let registry = Arc::downgrade(self);
         Box::new(move || {
-            if let Some(registry) = registry.upgrade() {
-                registry.direct_media_connected_if_current(&key.call_id, key.generation);
-            }
+            registry.upgrade().is_some_and(|registry| {
+                registry.direct_media_connected_if_current(&key.call_id, key.generation)
+            })
         })
     }
 
@@ -5625,6 +5625,23 @@ mod tests {
         registry.remove_if_current("READY", current);
         hook();
         assert!(!registry.media_connected_if_current("READY", current));
+    }
+
+    #[test]
+    fn promotion_rejects_a_delayed_direct_readiness_hook() {
+        let registry = Arc::new(CallRegistry::new());
+        let generation = registry.insert(session("PROMOTED"));
+        let hook = registry.direct_media_connected_hook(MediaSessionKey {
+            call_id: "PROMOTED".into(),
+            generation,
+        });
+        registry
+            .active_calls()
+            .get_mut("PROMOTED")
+            .unwrap()
+            .is_group_call = true;
+        assert!(!hook());
+        assert!(!registry.media_connected_if_current("PROMOTED", generation));
     }
 
     #[test]

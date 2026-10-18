@@ -1065,6 +1065,8 @@ pub struct CallEngine {
     /// order they arrive: inbound media cannot flow before the relay answers our allocate, so arming
     /// on the accept alone reports the allocation interval itself as lost reception.
     peer_has_answered: bool,
+    /// An outgoing answer must install receive keys before it can announce readiness.
+    answer_recv_keys_installed: bool,
     /// One accepted direct-call media-ready notification per engine, even after relay migration.
     media_connected_notified: bool,
     started: bool,
@@ -1243,6 +1245,7 @@ impl CallEngine {
             allocate_pending: false,
             allocated: false,
             peer_has_answered: false,
+            answer_recv_keys_installed: false,
             media_connected_notified: false,
             started: false,
             terminated: false,
@@ -1894,8 +1897,12 @@ impl CallEngine {
                 v.peer_keyframe_pending = None;
                 v.inbound_gap_timestamp = None;
             }
-            return rekeyed;
+            if !rekeyed {
+                return false;
+            }
         }
+        self.answer_recv_keys_installed = true;
+        self.maybe_publish_media_connected();
         true
     }
 
@@ -1969,7 +1976,8 @@ impl CallEngine {
             && self.allocated
             && self.media.is_some()
             && self.group.is_none()
-            && (self.direction == CallDirection::Incoming || self.peer_has_answered)
+            && (self.direction == CallDirection::Incoming
+                || (self.peer_has_answered && self.answer_recv_keys_installed))
         {
             self.media_connected_notified = true;
             self.outbox
@@ -7384,6 +7392,47 @@ mod tests {
             .iter()
             .filter(|output| matches!(output, Output::Event(CallEvent::MediaConnected)))
             .count()
+    }
+
+    #[test]
+    fn separate_answer_and_rekey_require_both_facts_in_either_order() {
+        for answer_first in [false, true] {
+            let mut cfg = config(true);
+            cfg.direction = CallDirection::Outgoing;
+            let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            let success = allocate_success(&eng);
+            eng.handle_input(1, Input::RelayPacket(&success));
+            assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            if answer_first {
+                eng.peer_answered(2);
+            } else {
+                assert!(eng.rekey_recv(PEER_LID));
+            }
+            assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            if answer_first {
+                assert!(eng.rekey_recv(PEER_LID));
+            } else {
+                eng.peer_answered(3);
+            }
+            assert_eq!(connected_count(&drain(&mut eng).0), 1);
+        }
+    }
+
+    #[test]
+    fn answered_without_a_successful_rekey_never_announces_readiness() {
+        let mut cfg = config(true);
+        cfg.direction = CallDirection::Outgoing;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.peer_answered(1);
+        eng.media.as_mut().unwrap().call_key.clear();
+        assert!(!eng.rekey_recv(PEER_LID));
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
     }
 
     #[test]
