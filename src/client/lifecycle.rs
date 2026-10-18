@@ -319,6 +319,12 @@ impl Client {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
 
+    /// A permanent verdict, independent of whether the host has started a run
+    /// loop or enabled reconnects. Local durable replay also works before run.
+    pub(crate) fn is_permanently_stopped(&self) -> bool {
+        self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal()
+    }
+
     /// Whether the client is finished for good, as opposed to being between
     /// connections.
     ///
@@ -343,7 +349,7 @@ impl Client {
     /// waiter parked on a connection that is never coming has no other way to
     /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
-        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
+        if self.is_permanently_stopped() {
             return true;
         }
         // The reconnect preference alone is not proof: an application may

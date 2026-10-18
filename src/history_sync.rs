@@ -15,6 +15,28 @@ use crate::client::Client;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
 
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+const INLINE_NOTIFICATION_ENCODING_THRESHOLD: usize = 256 * 1024;
+
+fn encode_history_sync_notification(
+    mut notification: DetachedHistorySyncNotification,
+    tracker: crate::sync_task::HistorySyncTaskTracker,
+) -> (
+    DetachedHistorySyncNotification,
+    Vec<u8>,
+    crate::sync_task::HistorySyncTaskTracker,
+) {
+    notification
+        .notification
+        .initial_hist_bootstrap_inline_payload = notification
+        .inline_payload
+        .as_ref()
+        .map(|bytes| bytes.to_vec());
+    let encoded = waproto::codec::history_sync_notification_to_vec(&notification.notification);
+    notification
+        .notification
+        .initial_hist_bootstrap_inline_payload = None;
+    (notification, encoded, tracker)
+}
 
 fn history_sync_metadata<'a>(
     notification: &'a DetachedHistorySyncNotification,
@@ -290,10 +312,34 @@ impl Client {
             "history notification does not belong to this Client account"
         );
         drop(identity);
-        let notification =
-            waproto::codec::history_sync_notification_decode(notification)?;
-        self.commit_history_sync_notification(key, notification.into())
+        // Acquire before decoding: callers may replay many large inline blobs
+        // concurrently, and the decoded copies belong to the SDK's budget.
+        let permit = self
+            .acquire_history_sync_permit()
             .await
+            .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
+        let notification = waproto::codec::history_sync_notification_decode(notification)?;
+        let notification: DetachedHistorySyncNotification = notification.into();
+        let mut tracker = self
+            .begin_history_sync_task(notification.inline_payload.as_ref().map_or(0, Bytes::len));
+        tracker.set_processing_permit(permit);
+        let Some((notification, mut tracker)) = self
+            .capture_history_sync_notification(key, notification, tracker)
+            .await?
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.process_history_sync_task_inner(
+                key.id.clone(),
+                notification,
+                &mut tracker,
+                Some(key)
+            )
+            .await,
+            "history sync capture or processing did not complete"
+        );
+        Ok(())
     }
 
     /// Runs only after the inbound journal has durably retained this carrier.
@@ -312,18 +358,45 @@ impl Client {
                 sender: info.source.sender.to_string(),
                 id: info.id.to_string(),
             };
-            self.commit_history_sync_notification(&key, notification)
-                .await?;
+            let tracker = self.begin_history_sync_task(
+                notification.inline_payload.as_ref().map_or(0, Bytes::len),
+            );
+            if let Some((notification, mut tracker)) = self
+                .capture_history_sync_notification(&key, notification, tracker)
+                .await?
+            {
+                tracker.set_durable_key(key);
+                let task = crate::sync_task::MajorSyncTask::HistorySync {
+                    message_id: info.id.to_string(),
+                    notification: Box::new(notification),
+                    tracker,
+                };
+                // Never hold the receive/drain permit waiting for a download
+                // to free a queue slot. Failure retains the journal, while the
+                // host also owns a replayable notification after its commit.
+                self.major_sync_task_sender
+                    .try_send(task)
+                    .map_err(|_| anyhow::anyhow!("history sync work queue is unavailable"))?;
+            }
         }
         Ok(())
     }
 
-    async fn commit_history_sync_notification(
+    async fn capture_history_sync_notification(
         self: &Arc<Self>,
         key: &HistorySyncKey,
         notification: DetachedHistorySyncNotification,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.is_shutting_down(), "history sync is shutting down");
+        tracker: crate::sync_task::HistorySyncTaskTracker,
+    ) -> anyhow::Result<
+        Option<(
+            DetachedHistorySyncNotification,
+            crate::sync_task::HistorySyncTaskTracker,
+        )>,
+    > {
+        anyhow::ensure!(
+            !self.is_permanently_stopped(),
+            "history sync is shutting down"
+        );
         let metadata = history_sync_metadata(&notification);
         if self.skip_history_sync_enabled()
             || self
@@ -338,36 +411,56 @@ impl Client {
                 crate::types::presence::ReceiptType::HistorySync,
             )
             .await;
-            return Ok(());
+            return Ok(None);
         }
         let hook = self
             .history_sync_durability_hook
             .get()
             .ok_or_else(|| anyhow::anyhow!("history sync durability hook is not registered"))?;
-        // Reattach only for the host's durable serialization; the parser keeps
-        // sharing the detached inline backing without duplicating a decoded graph.
-        let mut complete = notification.notification.clone();
-        complete.initial_hist_bootstrap_inline_payload = notification
+        // Large inline copies and protobuf encoding must not stall receive's
+        // executor. The tracker follows the blocking work even if its caller
+        // is cancelled, then follows the hook and queued/running processing.
+        let (notification, encoded, tracker) = if notification
             .inline_payload
             .as_ref()
-            .map(|bytes| bytes.to_vec());
-        let encoded = waproto::codec::history_sync_notification_to_vec(&complete);
-        drop(complete);
+            .is_some_and(|bytes| bytes.len() >= INLINE_NOTIFICATION_ENCODING_THRESHOLD)
+        {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            self.runtime
+                .spawn_blocking(Box::new(move || {
+                    let _ = tx.send(encode_history_sync_notification(notification, tracker));
+                }))
+                .await;
+            rx.await
+                .map_err(|_| anyhow::anyhow!("history notification encoding did not complete"))?
+        } else {
+            encode_history_sync_notification(notification, tracker)
+        };
+        let metadata = history_sync_metadata(&notification);
         hook.on_notification(key, &metadata, &encoded).await?;
-        drop(encoded);
-        let mut tracker = self
-            .begin_history_sync_task(notification.inline_payload.as_ref().map_or(0, Bytes::len));
         anyhow::ensure!(
-            self.process_history_sync_task_inner(
-                key.id.clone(),
-                notification,
-                &mut tracker,
-                Some(key),
-            )
-            .await,
-            "history sync capture or processing did not complete"
+            !self.is_permanently_stopped(),
+            "history sync is shutting down"
         );
-        Ok(())
+        Ok(Some((notification, tracker)))
+    }
+
+    pub(crate) async fn acquire_history_sync_permit(
+        &self,
+    ) -> Option<async_lock::SemaphoreGuardArc> {
+        use futures::FutureExt as _;
+        loop {
+            let state_changed = self.session_state_notifier.listen();
+            if self.is_permanently_stopped() {
+                return None;
+            }
+            futures::select_biased! {
+                _ = state_changed.fuse() => {},
+                permit = self.history_sync_activity.processing_permits.acquire_arc().fuse() => {
+                    return (!self.is_permanently_stopped()).then_some(permit);
+                },
+            }
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync", level = "debug", skip_all, fields(msg_id = %message_id)))]
@@ -460,8 +553,32 @@ impl Client {
         notification: DetachedHistorySyncNotification,
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
     ) {
-        self.process_history_sync_task_inner(message_id, notification, tracker, None)
+        let Some(permit) = self.acquire_history_sync_permit().await else {
+            return;
+        };
+        self.process_history_sync_task_with_permit(message_id, notification, tracker, permit)
             .await;
+    }
+
+    pub(crate) async fn process_history_sync_task_with_permit(
+        self: &Arc<Self>,
+        message_id: String,
+        notification: DetachedHistorySyncNotification,
+        tracker: &mut crate::sync_task::HistorySyncTaskTracker,
+        permit: async_lock::SemaphoreGuardArc,
+    ) {
+        tracker.set_processing_permit(permit);
+        let key = tracker.take_durable_key();
+        self.process_history_sync_task_inner(message_id, notification, tracker, key.as_deref())
+            .await;
+    }
+
+    fn history_processing_stopped(&self, durable: bool) -> bool {
+        if durable {
+            self.is_permanently_stopped()
+        } else {
+            self.is_shutting_down()
+        }
     }
 
     async fn process_history_sync_task_inner(
@@ -471,7 +588,7 @@ impl Client {
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
         durable_key: Option<&HistorySyncKey>,
     ) -> bool {
-        if self.is_shutting_down() {
+        if self.history_processing_stopped(durable_key.is_some()) {
             log::debug!("Aborting history sync {} before processing", message_id);
             return false;
         }
@@ -507,11 +624,11 @@ impl Client {
             self.signal_shutdown_sync();
         }
 
-        if self.is_shutting_down() {
+        if self.history_processing_stopped(durable_key.is_some()) {
             log::debug!(
                 "Aborting history sync {} before payload acquisition during shutdown (early receipt attempted: {})",
                 message_id,
-                capture_hook.is_none()
+                capture_hook.is_none() && durable_key.is_none()
             );
             return false;
         }
@@ -526,7 +643,8 @@ impl Client {
             (inline_payload, payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
-            if self.is_shutting_down() || !self.is_socket_connected() {
+            if self.history_processing_stopped(durable_key.is_some()) || !self.is_socket_connected()
+            {
                 log::debug!(
                     "Aborting history sync {} before blob download: client disconnected",
                     message_id
@@ -547,7 +665,7 @@ impl Client {
                     (Bytes::from(bytes), payload_bytes)
                 }
                 Err(e) => {
-                    if self.is_shutting_down() {
+                    if self.history_processing_stopped(durable_key.is_some()) {
                         log::debug!(
                             "History sync blob download aborted during shutdown: {:?}",
                             e
@@ -633,7 +751,9 @@ impl Client {
             Some((result, secret_collector.into_entries()))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
+            let processing_permit = tracker.processing_permit();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
+                let _permit = processing_permit;
                 let result = process_history_sync_bytes_with_record_sink(
                     compressed_data,
                     own_user.as_deref(),
@@ -650,7 +770,7 @@ impl Client {
             result_rx.await.ok()
         };
 
-        if self.is_shutting_down() {
+        if self.history_processing_stopped(durable_key.is_some()) {
             log::debug!(
                 "Aborting history sync {} after parse during shutdown",
                 message_id
