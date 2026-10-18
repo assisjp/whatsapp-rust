@@ -13,8 +13,15 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use wacore::types::events::InboundMessage;
 
 impl Client {
-    /// The registered inbound durability hook, if any. `None` (default) keeps
-    /// the at-most-once ack path without live-retention locking or backing.
+    /// History notifications reuse the bounded carrier journal and its Signal
+    /// ordering, including when no live-message consumer hook is installed.
+    pub(crate) fn inbound_journal_enabled(&self) -> bool {
+        self.inbound_durability_hook.get().is_some()
+            || self.history_sync_durability_hook.get().is_some()
+    }
+
+    /// The registered live-message consumer, independent of history recovery.
+    /// With neither hook registered, the default path avoids journal overhead.
     pub(crate) fn inbound_durability_hook(&self) -> Option<Arc<dyn InboundDurabilityHook>> {
         self.inbound_durability_hook.get().cloned()
     }
@@ -130,7 +137,7 @@ impl Client {
     /// counting suppressions must not count that one. A replay whose commit
     /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
-        if self.inbound_durability_hook().is_some() {
+        if self.inbound_journal_enabled() {
             let raw = self
                 .inbound_commit_batch
                 .live_retention

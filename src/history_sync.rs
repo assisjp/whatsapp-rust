@@ -1,4 +1,5 @@
 use crate::types::events::{CallLogHistory, Event, LazyHistorySync};
+use buffa::Message as _;
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::history_sync::{
@@ -10,6 +11,7 @@ use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
 use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
 
+use crate::HistorySyncKey;
 use crate::client::Client;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
 
@@ -256,6 +258,119 @@ impl HistoryMsgSecretRecordVisitor for &mut HistorySecretSeedCollector {
 }
 
 impl Client {
+    /// Replay a host-retained notification for this Client's own account.
+    ///
+    /// `notification` is exactly the encoded protobuf supplied to
+    /// [`crate::HistorySyncDurabilityHook::on_notification`]. Register the same
+    /// idempotent hook before replaying. This does not consume or delete the
+    /// host's record: the host decides when its recovery work is complete.
+    /// A replay may repeat events and callbacks. It requires the account's
+    /// identity to be loaded; downloaded chunks also need a connected socket.
+    /// Inline payloads can be processed without a socket, but `Ok` only proves
+    /// local capture/processing, not receipt delivery or remote acknowledgement.
+    pub async fn replay_history_sync_notification(
+        self: &Arc<Self>,
+        key: &HistorySyncKey,
+        notification: &[u8],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.history_sync_durability_hook.get().is_some(),
+            "history sync durability hook is not registered"
+        );
+        let chat: Jid = key.chat.parse()?;
+        let sender: Jid = key.sender.parse()?;
+        let identity = self.persistence_manager.get_device_snapshot();
+        anyhow::ensure!(
+            !key.id.is_empty()
+                && crate::send::is_own_identity(identity.pn.as_ref(), identity.lid.as_ref(), &chat)
+                && crate::send::is_own_identity(
+                    identity.pn.as_ref(),
+                    identity.lid.as_ref(),
+                    &sender
+                ),
+            "history notification does not belong to this Client account"
+        );
+        drop(identity);
+        let notification =
+            waproto::whatsapp::message::HistorySyncNotification::decode_from_slice(notification)?;
+        self.commit_history_sync_notification(key, notification.into())
+            .await
+    }
+
+    /// Runs only after the inbound journal has durably retained this carrier.
+    pub(crate) async fn commit_history_sync_carrier(
+        self: &Arc<Self>,
+        info: &crate::types::message::MessageInfo,
+        carrier: Bytes,
+    ) -> anyhow::Result<()> {
+        if self.history_sync_durability_hook.get().is_none() || !info.source.is_from_me {
+            return Ok(());
+        }
+        let (_, notification) = wacore::messages::decode_unpadded_detached_history_sync(carrier)?;
+        if let Some(notification) = notification {
+            let key = HistorySyncKey {
+                chat: info.source.chat.to_string(),
+                sender: info.source.sender.to_string(),
+                id: info.id.to_string(),
+            };
+            self.commit_history_sync_notification(&key, notification)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn commit_history_sync_notification(
+        self: &Arc<Self>,
+        key: &HistorySyncKey,
+        notification: DetachedHistorySyncNotification,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_shutting_down(), "history sync is shutting down");
+        let metadata = history_sync_metadata(&notification);
+        if self.skip_history_sync_enabled()
+            || self
+                .history_sync_admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    admission.decide(&metadata) == HistorySyncDecision::RejectAndAcknowledge
+                })
+        {
+            self.send_protocol_receipt(
+                key.id.clone(),
+                crate::types::presence::ReceiptType::HistorySync,
+            )
+            .await;
+            return Ok(());
+        }
+        let hook = self
+            .history_sync_durability_hook
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("history sync durability hook is not registered"))?;
+        // Reattach only for the host's durable serialization; the parser keeps
+        // sharing the detached inline backing without duplicating a decoded graph.
+        let mut complete = notification.notification.clone();
+        complete.initial_hist_bootstrap_inline_payload = notification
+            .inline_payload
+            .as_ref()
+            .map(|bytes| bytes.to_vec());
+        let encoded = complete.encode_to_vec();
+        drop(complete);
+        hook.on_notification(key, &metadata, &encoded).await?;
+        drop(encoded);
+        let mut tracker = self
+            .begin_history_sync_task(notification.inline_payload.as_ref().map_or(0, Bytes::len));
+        anyhow::ensure!(
+            self.process_history_sync_task_inner(
+                key.id.clone(),
+                notification,
+                &mut tracker,
+                Some(key),
+            )
+            .await,
+            "history sync capture or processing did not complete"
+        );
+        Ok(())
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync", level = "debug", skip_all, fields(msg_id = %message_id)))]
     pub(crate) async fn handle_history_sync(
         self: &Arc<Self>,
@@ -346,11 +461,23 @@ impl Client {
         notification: DetachedHistorySyncNotification,
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
     ) {
+        self.process_history_sync_task_inner(message_id, notification, tracker, None)
+            .await;
+    }
+
+    async fn process_history_sync_task_inner(
+        self: &Arc<Self>,
+        message_id: String,
+        notification: DetachedHistorySyncNotification,
+        tracker: &mut crate::sync_task::HistorySyncTaskTracker,
+        durable_key: Option<&HistorySyncKey>,
+    ) -> bool {
         if self.is_shutting_down() {
             log::debug!("Aborting history sync {} before processing", message_id);
-            return;
+            return false;
         }
 
+        let inline_payload_len = notification.inline_payload.as_ref().map(Bytes::len);
         let DetachedHistorySyncNotification {
             mut notification,
             inline_payload,
@@ -366,7 +493,7 @@ impl Client {
         // With a capture hook the receipt waits until the hook has captured
         // the chunk. Download or capture failures leave it unacknowledged.
         let capture_hook = self.history_sync_capture_hook.get().cloned();
-        if capture_hook.is_none() {
+        if capture_hook.is_none() && durable_key.is_none() {
             self.send_protocol_receipt(
                 message_id.clone(),
                 crate::types::presence::ReceiptType::HistorySync,
@@ -387,7 +514,7 @@ impl Client {
                 message_id,
                 capture_hook.is_none()
             );
-            return;
+            return false;
         }
 
         // Use take() to avoid cloning large payloads - moves ownership instead
@@ -405,7 +532,7 @@ impl Client {
                     "Aborting history sync {} before blob download: client disconnected",
                     message_id
                 );
-                return;
+                return false;
             }
             // The native in-memory downloader streams decryption and safely
             // pre-sizes its fresh retry buffer from the declared file length.
@@ -429,11 +556,32 @@ impl Client {
                     } else {
                         log::error!("Failed to download history sync blob: {:?}", e);
                     }
-                    return;
+                    return false;
                 }
             }
         };
         tracker.set_payload_bytes(payload_bytes);
+
+        if let Some(key) = durable_key {
+            let Some(hook) = self.history_sync_durability_hook.get() else {
+                return false;
+            };
+            let metadata = HistorySyncMetadata {
+                sync_type: notification.sync_type.map(|kind| kind as i32),
+                chunk_order: notification.chunk_order,
+                progress: notification.progress,
+                file_length: notification.file_length,
+                inline_payload_len,
+                peer_data_request_session_id: notification.peer_data_request_session_id.as_deref(),
+            };
+            if let Err(error) = hook
+                .on_compressed_chunk(key, &metadata, &compressed_data)
+                .await
+            {
+                log::warn!("History sync chunk was not durable; withholding receipt: {error:?}");
+                return false;
+            }
+        }
 
         if let Some(hook) = capture_hook {
             if let Err(e) = hook
@@ -450,13 +598,15 @@ impl Client {
                     message_id,
                     e
                 );
-                return;
+                return false;
             }
-            self.send_protocol_receipt(
-                message_id.clone(),
-                crate::types::presence::ReceiptType::HistorySync,
-            )
-            .await;
+            if durable_key.is_none() {
+                self.send_protocol_receipt(
+                    message_id.clone(),
+                    crate::types::presence::ReceiptType::HistorySync,
+                )
+                .await;
+            }
         }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -506,11 +656,18 @@ impl Client {
                 "Aborting history sync {} after parse during shutdown",
                 message_id
             );
-            return;
+            return false;
         }
 
         match parse_result {
             Some((Ok(sync_result), secret_entries)) => {
+                if durable_key.is_some() {
+                    self.send_protocol_receipt(
+                        message_id.clone(),
+                        crate::types::presence::ReceiptType::HistorySync,
+                    )
+                    .await;
+                }
                 log::info!(
                     "Successfully processed HistorySync (message {message_id}); {} conversations",
                     sync_result.conversations_processed
@@ -638,11 +795,14 @@ impl Client {
             }
             Some((Err(e), _)) => {
                 log::error!("Failed to process HistorySync data: {:?}", e);
+                return false;
             }
             None => {
                 log::error!("History sync blocking task was cancelled");
+                return false;
             }
         }
+        true
     }
 
     #[cfg_attr(

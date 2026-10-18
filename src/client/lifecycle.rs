@@ -522,6 +522,7 @@ impl Client {
             plugin_host,
             inbound_durability_hook,
             history_sync_capture_hook,
+            history_sync_durability_hook,
             group_notification_durability_hook,
             custom_enc_handlers,
             retry_admission,
@@ -743,6 +744,9 @@ impl Client {
             chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers,
             inbound_durability_hook: inbound_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            history_sync_durability_hook: history_sync_durability_hook
                 .map(std::sync::OnceLock::from)
                 .unwrap_or_default(),
             history_sync_capture_hook: history_sync_capture_hook
