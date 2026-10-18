@@ -94,6 +94,8 @@ impl StanzaHandler for CallHandler {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-control")]
                 let mut call = call;
+                #[cfg(feature = "voip-control")]
+                let mut direct_accept_alias = None;
                 // Bind direct answers before any await. A trusted namespace lookup may suspend;
                 // the captured generation must still own the call when its answer is committed.
                 #[cfg(feature = "voip-control")]
@@ -135,6 +137,7 @@ impl StanzaHandler for CallHandler {
                             else {
                                 return true;
                             };
+                            direct_accept_alias = client.swap_pn_lid_namespace(&sender).await;
                             if !registry.is_current(call.action.call_id(), generation) {
                                 return true;
                             }
@@ -145,7 +148,15 @@ impl StanzaHandler for CallHandler {
                             }
                             Some((generation, creator, sender))
                         }
-                        None => return true,
+                        None => {
+                            // An unmanaged call has no owned state to authorize. Preserve the
+                            // signaling observation without letting it mutate a later registration.
+                            client
+                                .core
+                                .event_bus
+                                .dispatch(Event::IncomingCall(Box::new(call)));
+                            return true;
+                        }
                     }
                 } else {
                     None
@@ -418,6 +429,25 @@ impl StanzaHandler for CallHandler {
                             let bytes = capability.content_bytes().unwrap_or_default();
                             capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
                         });
+                        let mut capability_sender = routed_call_sender(&call);
+                        if matches!(&call.action, CallAction::PreAccept { .. })
+                            && !client
+                                .call_registry()
+                                .is_group_call_if_current(call.action.call_id(), generation)
+                            && let Some(session) = client
+                                .call_registry()
+                                .snapshot_if_current(call.action.call_id(), generation)
+                            && let Some(canonical) = canonical_call_identity(
+                                &client,
+                                &capability_sender,
+                                &session.peer_jid,
+                            )
+                            .await
+                        {
+                            // The accept authenticates in the session's namespace. Retain earlier
+                            // codec statements under that same trusted device identity.
+                            capability_sender = canonical;
+                        }
                         // A device states its codec capability in the `<preaccept>` and its
                         // `<accept>` need not repeat it -- a video answer omits the child by
                         // construction. Retained per device so the accept below reads what THIS
@@ -426,7 +456,7 @@ impl StanzaHandler for CallHandler {
                         client.call_registry().note_peer_capability(
                             call.action.call_id(),
                             generation,
-                            &routed_call_sender(&call),
+                            &capability_sender,
                             peer_mlow_bit,
                         );
                         let device = if let Some(capability) = capability
@@ -439,7 +469,7 @@ impl StanzaHandler for CallHandler {
                             };
                             if let Some(version) = version {
                                 Some(
-                                    GroupCallDevice::new(routed_call_sender(&call))
+                                    GroupCallDevice::new(capability_sender)
                                         .with_capability(version, bytes.to_vec()),
                                 )
                             } else {
@@ -479,11 +509,22 @@ impl StanzaHandler for CallHandler {
                         // The peer's capability and the answering device land in the same stanza
                         // and both have to be applied before the first inbound packet, so they
                         // travel as one message rather than racing.
-                        let peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                        let mut peer_mlow_bit = client.call_registry().resolve_peer_capability(
                             call.action.call_id(),
                             &sender,
                             peer_mlow_bit,
                         );
+                        if peer_mlow_bit == CapabilityBit::Unknown
+                            && let Some(alias) = direct_accept_alias.as_ref()
+                        {
+                            // The mapping may have arrived after preaccept. Never borrow another
+                            // device's rollout bit: this trusted alias preserves the device id.
+                            peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                                call.action.call_id(),
+                                alias,
+                                CapabilityBit::Unknown,
+                            );
+                        }
                         let audio_codec = client
                             .call_registry()
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
@@ -1885,6 +1926,146 @@ mod tests {
                     .answering_device_if_current("CALL-ID-0001", generation)
                     .is_none()
             );
+        }
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn unmanaged_accept_preserves_signaling_observation_without_owned_effects() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("16000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(matches!(
+            events.try_recv().as_deref(),
+            Ok(Event::IncomingCall(call))
+                if matches!(call.action, CallAction::Accept { .. })
+                    && call.from == fake_caller_lid()
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(client.call_registry().active_count(), 0);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!cancelled, "the router still owns the generic ACK");
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn capabilityless_accept_preserves_the_trusted_pn_devices_preaccept_codec() {
+        for mapping_before_preaccept in [true, false] {
+            for accept_as_pn in [true, false] {
+                for answering_device in [4, 5] {
+                    let client = make_sending_client().await;
+                    let peer = Jid::new("222222222222222", Server::Lid);
+                    let pn = Jid::new("12025550112", Server::Pn);
+                    let creator = fake_caller_lid();
+                    let registry = client.call_registry();
+                    let mut session = wacore::voip_control::CallSession::new_outgoing(
+                        "ALIAS-CODEC",
+                        peer.clone(),
+                        creator.clone(),
+                    );
+                    session.audio_format =
+                        Some(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS);
+                    let generation = registry.insert(session);
+                    let rekey = registry
+                        .resident_session("ALIAS-CODEC", generation)
+                        .unwrap()
+                        .take_rekey_receiver()
+                        .unwrap();
+                    if mapping_before_preaccept {
+                        client
+                            .add_lid_pn_mapping(
+                                &peer.user,
+                                &pn.user,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let signaling = |tag: &'static str, sender: Jid, capability: bool| {
+                        let mut children = vec![
+                            NodeBuilder::new("audio")
+                                .attr("enc", "opus")
+                                .attr("rate", "16000")
+                                .build(),
+                        ];
+                        if capability {
+                            children.push(
+                                NodeBuilder::new("capability")
+                                    .attr("ver", "1")
+                                    .bytes(
+                                        wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER
+                                            .to_vec(),
+                                    )
+                                    .build(),
+                            );
+                        }
+                        NodeBuilder::new("call")
+                            .attr("from", sender)
+                            .attr("id", format!("ALIAS-{tag}"))
+                            .attr("t", "1766847151")
+                            .children([NodeBuilder::new(tag)
+                                .attr("call-id", "ALIAS-CODEC")
+                                .attr("call-creator", creator.clone())
+                                .children(children)
+                                .build()])
+                            .build()
+                    };
+                    let mut cancelled = false;
+                    assert!(
+                        CallHandler
+                            .handle(
+                                client.clone(),
+                                node_to_owned_ref(&signaling("preaccept", pn.with_device(4), true)),
+                                &mut cancelled,
+                            )
+                            .await
+                    );
+                    if !mapping_before_preaccept {
+                        client
+                            .add_lid_pn_mapping(
+                                &peer.user,
+                                &pn.user,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let answering =
+                        if accept_as_pn { &pn } else { &peer }.with_device(answering_device);
+                    assert!(
+                        CallHandler
+                            .handle(
+                                client.clone(),
+                                node_to_owned_ref(&signaling("accept", answering, false)),
+                                &mut cancelled,
+                            )
+                            .await
+                    );
+                    let answer = rekey
+                        .try_recv()
+                        .expect("authenticated answer reaches media");
+                    assert_eq!(
+                        answer.answering_lid,
+                        peer.with_device(answering_device).to_string()
+                    );
+                    assert_eq!(
+                        answer.audio_codec,
+                        (answering_device == 4)
+                            .then_some(wacore::voip_control::MediaAudioCodec::Opus),
+                        "a trusted alias keeps its own codec statement, never a sibling's"
+                    );
+                }
+            }
         }
     }
 
