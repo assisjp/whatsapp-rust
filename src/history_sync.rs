@@ -1,5 +1,4 @@
 use crate::types::events::{CallLogHistory, Event, LazyHistorySync};
-use buffa::Message as _;
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::history_sync::{
@@ -292,7 +291,7 @@ impl Client {
         );
         drop(identity);
         let notification =
-            waproto::whatsapp::message::HistorySyncNotification::decode_from_slice(notification)?;
+            waproto::codec::history_sync_notification_decode(notification)?;
         self.commit_history_sync_notification(key, notification.into())
             .await
     }
@@ -352,7 +351,7 @@ impl Client {
             .inline_payload
             .as_ref()
             .map(|bytes| bytes.to_vec());
-        let encoded = complete.encode_to_vec();
+        let encoded = waproto::codec::history_sync_notification_to_vec(&complete);
         drop(complete);
         hook.on_notification(key, &metadata, &encoded).await?;
         drop(encoded);
