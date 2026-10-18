@@ -7,6 +7,7 @@ use thiserror::Error;
 use super::Client;
 #[cfg(feature = "client-lifecycle")]
 use super::{ClientLifecycle, LifecycleRegistration};
+use crate::HistorySyncDurabilityHook;
 use crate::cache_config::CacheConfig;
 use crate::features::PresencePolicy;
 use crate::http::HttpClient;
@@ -412,6 +413,25 @@ impl ClientBuilder {
         self
     }
 
+    /// Retain self-sent history notifications and chunks before ACK/receipt.
+    /// See [`HistorySyncDurabilityHook`] for backend requirements and replay.
+    pub fn with_history_sync_durability_hook<H>(mut self, hook: H) -> Self
+    where
+        H: HistorySyncDurabilityHook + 'static,
+    {
+        self.extensions_mut().history_sync_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register a shared history recovery hook. The last registration wins.
+    pub fn with_history_sync_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncDurabilityHook>,
+    ) -> Self {
+        self.extensions_mut().history_sync_durability_hook = Some(hook);
+        self
+    }
+
     /// Await history capture before its receipt, independently of message durability.
     /// See [`HistorySyncCaptureHook`] for input, cancellation and replay limits.
     pub fn with_history_sync_capture_hook<H>(mut self, hook: H) -> Self
@@ -698,11 +718,10 @@ impl ClientBuilder {
                 return Err(ClientBuilderError::InvalidPluginTaskDrainTimeout);
             }
 
-            if self
-                .extensions
-                .as_deref()
-                .is_some_and(|extensions| extensions.inbound_durability_hook.is_some())
-            {
+            if self.extensions.as_deref().is_some_and(|extensions| {
+                extensions.inbound_durability_hook.is_some()
+                    || extensions.history_sync_durability_hook.is_some()
+            }) {
                 probe_durability_backend(&persistence_manager.backend(), &runtime).await?;
             }
 
@@ -1033,6 +1052,7 @@ impl Drop for ClientConstructionGuard {
 pub(super) struct ClientExtensions {
     pub(super) inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     pub(super) history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
+    pub(super) history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     pub(super) group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
     pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
@@ -1388,6 +1408,73 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    struct HistoryRecovery;
+
+    #[async_trait::async_trait]
+    impl HistorySyncDurabilityHook for HistoryRecovery {
+        async fn on_notification(
+            &self,
+            _: &crate::HistorySyncKey,
+            _: &crate::HistorySyncMetadata<'_>,
+            _: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_compressed_chunk(
+            &self,
+            _: &crate::HistorySyncKey,
+            _: &crate::HistorySyncMetadata<'_>,
+            _: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn history_recovery_requires_a_capable_backend_and_preserves_registration() {
+        let hook: Arc<dyn HistorySyncDurabilityHook> = Arc::new(HistoryRecovery);
+        let (client, _) = complete_builder()
+            .await
+            .with_history_sync_durability_hook(HistoryRecovery)
+            .with_history_sync_durability_hook_arc(hook.clone())
+            .build()
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(client.inbound_journal_enabled());
+        assert!(client.inbound_durability_hook.get().is_none());
+        assert!(client.history_sync_capture_hook.get().is_none());
+        assert!(Arc::ptr_eq(
+            client.history_sync_durability_hook.get().unwrap(),
+            &hook
+        ));
+
+        use diesel::{Connection, RunQueryDsl, SqliteConnection};
+        let db = format!(
+            "file:history_no_pending_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let backend = Arc::new(crate::store::SqliteStore::open(&db).await.unwrap());
+        let mut sql = SqliteConnection::establish(&db).unwrap();
+        diesel::sql_query("ALTER TABLE pending_inbound_messages RENAME TO unavailable_pending")
+            .execute(&mut sql)
+            .unwrap();
+        let persistence = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let result = ClientBuilder::new()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_history_sync_durability_hook(HistoryRecovery)
+            .build()
+            .await;
+        assert!(matches!(
+            result,
+            Err(ClientBuilderError::UnsupportedDurabilityBackend(_))
+        ));
     }
 
     struct MessageCommit;
