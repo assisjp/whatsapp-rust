@@ -429,66 +429,71 @@ impl<'a> AcceptCall<'a> {
         // write. RegisteredCall::drop must not reap the generation before teardown can claim it.
         teardown.arm();
         registration.disarm();
-        let (preaccept, accept) = if needs_group_relay {
-            // An invitation with no relay must answer first to trigger the relay allocation. Use
-            // the selected media answer once, rather than sending a second pair after the wait.
-            send_answer_node(self.client, &registration, &mut teardown, preaccept).await?;
-            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
-            group = Some(
-                match wacore::runtime::timeout(
-                    &*self.client.runtime,
-                    OFFER_ACK_RELAY_TIMEOUT,
-                    wait_for_group_relay(&registry, call_id, registration.generation),
-                )
-                .await
+        // Keep every post-answer error on the awaited cleanup path. Only dropping this future
+        // may select local-only cancellation; a timeout or invalid relay is still a setup failure.
+        let result = async {
+            let (preaccept, accept) = if needs_group_relay {
+                // An invitation with no relay must answer first to trigger the relay allocation. Use
+                // the selected media answer once, rather than sending a second pair after the wait.
+                send_answer_node(self.client, &registration, &mut teardown, preaccept).await?;
+                send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+                group = Some(
+                    match wacore::runtime::timeout(
+                        &*self.client.runtime,
+                        OFFER_ACK_RELAY_TIMEOUT,
+                        wait_for_group_relay(&registry, call_id, registration.generation),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => return Err(CallError::ResponseTimeout),
+                    },
+                );
+                if group
+                    .as_ref()
+                    .is_some_and(|group| (group.media == "video") != *offered_video)
                 {
-                    Ok(result) => result?,
-                    Err(_) => return Err(CallError::ResponseTimeout),
-                },
-            );
-            if group
-                .as_ref()
-                .is_some_and(|group| (group.media == "video") != *offered_video)
-            {
-                return Err(CallError::Response(
-                    "group offer signaling and roster media modes differ".to_string(),
-                ));
+                    return Err(CallError::Response(
+                        "group offer signaling and roster media modes differ".to_string(),
+                    ));
+                }
+                (None, None)
+            } else {
+                (Some(preaccept), Some(accept))
+            };
+            let (spec, built_call_id) = send_preaccept_then_prepare(
+                self.client,
+                &registration,
+                &mut teardown,
+                preaccept,
+                self.build_spec(has_video, audio_config, group, registration.generation),
+            )
+            .await?;
+            debug_assert_eq!(built_call_id, registration.call_id);
+            // The decrypt above may await on the network (prekey fetch). If the connection dropped
+            // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
+            // connection-specific error before checking the generation.
+            if !self.client.is_socket_connected() {
+                return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
             }
-            (None, None)
-        } else {
-            (Some(preaccept), Some(accept))
-        };
-        let (spec, built_call_id) = send_preaccept_then_prepare(
-            self.client,
-            &registration,
-            &mut teardown,
-            preaccept,
-            self.build_spec(has_video, audio_config, group, registration.generation),
-        )
-        .await?;
-        debug_assert_eq!(built_call_id, registration.call_id);
-        // The decrypt above may await on the network (prekey fetch). If the connection dropped
-        // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
-        // connection-specific error before checking the generation.
-        if !self.client.is_socket_connected() {
-            return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+            registration.ensure_current()?;
+            // Final acceptance waits until media setup succeeded and the registered generation is still
+            // current; only then may the caller apply the participant keys and enter the call.
+            if let Some(accept) = accept {
+                send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+            }
+            open_registered_media(
+                self.client,
+                &registration,
+                spec,
+                audio,
+                video,
+                // Incoming group epoch is applied through the roster replay, not here.
+                None,
+                engine_switch,
+            )
+            .await
         }
-        registration.ensure_current()?;
-        // Final acceptance waits until media setup succeeded and the registered generation is still
-        // current; only then may the caller apply the participant keys and enter the call.
-        if let Some(accept) = accept {
-            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
-        }
-        let result = open_registered_media(
-            self.client,
-            &registration,
-            spec,
-            audio,
-            video,
-            // Incoming group epoch is applied through the roster replay, not here.
-            None,
-            engine_switch,
-        )
         .await;
         let handle = match result {
             Ok(handle) => {
@@ -6248,6 +6253,179 @@ mod tests {
                 .is_current(incoming.action.call_id(), generation),
             "conflicting media must fail before accepting or replacing the ringing generation"
         );
+    }
+
+    fn register_relayless_group_offer(client: &Client) -> IncomingCall {
+        let mut incoming = incoming_offer(false);
+        incoming.group = Some(Box::new(
+            GroupCallUpdate::builder()
+                .call_id(incoming.action.call_id().to_string())
+                .call_creator(caller())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        ));
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.group = incoming.group.as_deref().cloned();
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .unwrap()
+            .unwrap();
+        incoming.set_ringing_generation(generation);
+        incoming
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_only_relayless_group_setup_errors_still_terminate() {
+        for timeout in [true, false] {
+            let (client, _) = make_sending_client().await;
+            let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+            install_noise_transport(&client, transport.clone()).await;
+            let incoming = register_relayless_group_offer(&client);
+            let call_id = incoming.action.call_id().to_string();
+            let generation = incoming.ringing_generation().unwrap();
+            let mut conflicting = incoming.group.as_deref().unwrap().clone();
+            let (_mic, source) = async_channel::unbounded::<Bytes>();
+            let (sink, _speaker) = async_channel::unbounded::<EncodedAudioFrame>();
+            let starting_client = client.clone();
+            let starting = tokio::spawn(async move {
+                starting_client
+                    .voip()
+                    .accept(&incoming)
+                    .local_only_on_cancel()
+                    .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source, sink)
+                    .start()
+                    .await
+            });
+            while transport.sent_count() < 2 {
+                assert!(!starting.is_finished());
+                tokio::task::yield_now().await;
+            }
+            if timeout {
+                tokio::time::advance(OFFER_ACK_RELAY_TIMEOUT).await;
+            } else {
+                conflicting.transaction_id = 2;
+                conflicting.media = "video".to_string();
+                conflicting.relay = Some(sample_group_relay(1));
+                assert_eq!(
+                    client
+                        .call_registry()
+                        .apply_group_update_if_current(conflicting, generation),
+                    wacore::voip_control::group::GroupStateApply::Applied
+                );
+            }
+            let error = starting.await.unwrap().err().expect("setup must fail");
+            if timeout {
+                assert!(matches!(error, CallError::ResponseTimeout));
+            } else {
+                assert!(matches!(error, CallError::Response(message)
+                    if message == "group offer signaling and roster media modes differ"));
+            }
+            assert_eq!(client.call_registry().active_count(), 0);
+            let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+            assert_eq!(frames.len(), 3, "normal errors await exactly one terminate");
+            let bytes = wacore_binary::util::unpack(&frames[2]).unwrap();
+            let node = wacore_binary::OwnedNodeRef::new(bytes.into_owned()).unwrap();
+            assert_eq!(
+                node.get().get_attr("to").map(ToString::to_string),
+                Some(Jid::new(&call_id, Server::Call).to_string())
+            );
+            assert_eq!(node.get().children().unwrap()[0].tag.as_ref(), "terminate");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_only_relayless_group_cancellation_sends_no_terminate() {
+        let (client, _) = make_sending_client().await;
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        install_noise_transport(&client, transport.clone()).await;
+        let incoming = register_relayless_group_offer(&client);
+        let (_mic, source) = async_channel::unbounded::<Bytes>();
+        let (sink, _speaker) = async_channel::unbounded::<EncodedAudioFrame>();
+        let starting_client = client.clone();
+        let starting = tokio::spawn(async move {
+            starting_client
+                .voip()
+                .accept(&incoming)
+                .local_only_on_cancel()
+                .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source, sink)
+                .start()
+                .await
+        });
+        while transport.sent_count() < 2 {
+            assert!(!starting.is_finished());
+            tokio::task::yield_now().await;
+        }
+        starting.abort();
+        assert!(starting.await.err().unwrap().is_cancelled());
+        assert_eq!(client.call_registry().active_count(), 0);
+        tokio::time::advance(OFFER_ACK_RELAY_TIMEOUT).await;
+        assert_eq!(
+            transport.sent_count(),
+            2,
+            "cancellation cannot send terminate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_only_cancellation_during_setup_error_terminate_never_retries() {
+        let (client, _) = make_sending_client().await;
+        let (entered_tx, entered) = async_channel::bounded(1);
+        let (release, release_rx) = async_channel::bounded(1);
+        let transport = Arc::new(GatedSendTransport {
+            gate_attempt: 2,
+            fail_gated_send: false,
+            attempts: AtomicUsize::new(0),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        install_noise_transport(&client, transport.clone()).await;
+        let incoming = register_relayless_group_offer(&client);
+        let call_id = incoming.action.call_id().to_string();
+        let (_mic, source) = async_channel::unbounded::<Bytes>();
+        let (sink, _speaker) = async_channel::unbounded::<EncodedAudioFrame>();
+        let starting_client = client.clone();
+        let starting = tokio::spawn(async move {
+            starting_client
+                .voip()
+                .accept(&incoming)
+                .local_only_on_cancel()
+                .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source, sink)
+                .start()
+                .await
+        });
+        tokio::time::timeout(OFFER_ACK_RELAY_TIMEOUT * 2, entered.recv())
+            .await
+            .expect("timeout cleanup must reach terminate")
+            .unwrap();
+        assert_eq!(client.call_registry().active_count(), 0);
+        starting.abort();
+        assert!(starting.await.err().unwrap().is_cancelled());
+        assert!(
+            client
+                .answer_transition_lock(&call_id)
+                .try_lock_arc()
+                .is_some()
+        );
+        tokio::task::yield_now().await;
+        // The writer still owns the original terminate. Once released, a later send acts as a
+        // queue barrier: cancellation must not have scheduled a second terminal write behind it.
+        release.send(()).await.unwrap();
+        client
+            .send_node(wacore_binary::builder::NodeBuilder::new("presence").build())
+            .await
+            .unwrap();
+        assert_eq!(transport.attempts.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
