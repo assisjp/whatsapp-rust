@@ -11391,7 +11391,7 @@ mod tests {
             "only the accepted answer was sent"
         );
         start.abort();
-        assert!(start.await.err().expect("cancelled startup").is_cancelled());
+        assert!(matches!(start.await, Err(error) if error.is_cancelled()));
         assert_eq!(
             client.call_registry().active_count(),
             0,
