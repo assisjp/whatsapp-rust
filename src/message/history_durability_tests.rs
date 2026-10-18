@@ -2,7 +2,6 @@ use super::*;
 use crate::store::traits::Backend;
 use crate::types::message::{MessageInfo, MessageSource};
 use crate::{HistorySyncDurabilityHook, HistorySyncKey, HistorySyncMetadata};
-use buffa::Message as _;
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
 use std::sync::Mutex;
@@ -42,7 +41,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
                 "the full carrier must be durable before the host callback"
             );
         }
-        let decoded = wa::message::HistorySyncNotification::decode_from_slice(notification)?;
+        let decoded = waproto::codec::history_sync_notification_decode(notification)?;
         assert_eq!(
             metadata.sync_type,
             decoded.sync_type.map(|kind| kind as i32)
@@ -92,7 +91,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
             .iter()
             .find(|(previous, _)| previous == key)
             .unwrap();
-        let decoded = wa::message::HistorySyncNotification::decode_from_slice(notification)?;
+        let decoded = waproto::codec::history_sync_notification_decode(notification)?;
         assert_eq!(metadata.chunk_order, decoded.chunk_order);
         if let Some(inline) = decoded.initial_hist_bootstrap_inline_payload {
             assert_eq!(compressed, inline);
@@ -106,7 +105,7 @@ fn notification() -> wa::message::HistorySyncNotification {
     let mut history = wa::HistorySync::default();
     history.sync_type = wa::history_sync::HistorySyncType::RECENT;
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&history.encode_to_vec()).unwrap();
+    encoder.write_all(&waproto::codec::history_sync_to_vec(&history)).unwrap();
     let compressed = encoder.finish().unwrap();
     let mut notification = wa::message::HistorySyncNotification::default();
     notification.sync_type = Some(wa::message::HistorySyncType::RECENT);
