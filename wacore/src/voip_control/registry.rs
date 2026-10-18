@@ -162,7 +162,7 @@ struct CallEntry {
     event_publication_reserved: Arc<AtomicBool>,
     /// Mirrors WA's stream mutex for user actions, peer signaling, and timeout callbacks.
     video_transition_lock: Arc<AsyncMutex<()>>,
-    /// Serializes participant controls and waiting-room state through their typed ACK.
+    /// Serializes direct answers, participant controls and waiting-room state through their ACK.
     group_transition_lock: Arc<AsyncMutex<()>>,
     /// Wakes a pending call-link media builder on admission, replacement, or terminal teardown.
     group_update_event: Arc<event_listener::Event>,
@@ -3058,7 +3058,8 @@ impl CallRegistry {
     /// Commit a verified direct outgoing answer against its original generation. Identities must
     /// already be canonicalized using the client's trusted PN/LID mapping. The captured media
     /// belongs to this generation, so a replacement racing delivery never receives these keys.
-    pub fn accept_direct_if_current(
+    /// Competing answers wait for the backend's verdict: refusal leaves the next answer eligible.
+    pub async fn accept_direct_if_current(
         &self,
         call_id: &str,
         generation: u64,
@@ -3069,21 +3070,28 @@ impl CallRegistry {
         if answer.answering_lid != device.to_string() {
             return false;
         }
+        let Some(transition) = self.group_transition_lock(call_id, generation) else {
+            return false;
+        };
+        let _transition = transition.lock().await;
+        let eligible = |entry: &CallEntry| {
+            entry.generation == generation
+                && !entry.is_group_call
+                && entry.session.phase() != CallPhase::Ended
+                && entry.session.direction == crate::voip_control::CallDirection::Outgoing
+                && entry.session.call_creator.to_non_ad() == creator.to_non_ad()
+                && entry.session.peer_jid.to_non_ad() == device.to_non_ad()
+                && entry.session.answering_device.is_none()
+        };
         let media = {
-            let mut map = self.active_calls();
-            let Some(entry) = map.get_mut(call_id).filter(|entry| {
-                entry.generation == generation
-                    && !entry.is_group_call
-                    && entry.session.direction == crate::voip_control::CallDirection::Outgoing
-                    && entry.session.call_creator.to_non_ad() == creator.to_non_ad()
-                    && entry.session.peer_jid.to_non_ad() == device.to_non_ad()
-                    && entry.session.answering_device.is_none()
-            }) else {
+            let map = self.active_calls();
+            let Some(entry) = map.get(call_id).filter(|entry| eligible(entry)) else {
                 return false;
             };
-            entry.session.answering_device = Some(device.clone());
             entry.media.clone()
         };
+        // External implementations may read the registry here. Never call them under its mutex,
+        // or expose a provisional winner that would discard contenders if this submit refuses.
         let delivered = media.is_some_and(|media| {
             media.submit(MediaCommand::RekeyRecv {
                 answering_lid: answer.answering_lid,
@@ -3091,17 +3099,14 @@ impl CallRegistry {
             })
         });
         if !delivered {
-            // A backend may refuse a command. Release only this reservation, outside the backend
-            // call: external submit implementations must never run under the registry mutex.
-            let mut map = self.active_calls();
-            if let Some(entry) = map.get_mut(call_id)
-                && entry.generation == generation
-                && entry.session.answering_device.as_ref() == Some(&device)
-            {
-                entry.session.answering_device = None;
-            }
+            return false;
         }
-        delivered
+        let mut map = self.active_calls();
+        let Some(entry) = map.get_mut(call_id).filter(|entry| eligible(entry)) else {
+            return false;
+        };
+        entry.session.answering_device = Some(device);
+        true
     }
 
     /// Caller side: record the callee device that answered (the inbound `<accept>`'s `call.from`), so a
@@ -5707,6 +5712,8 @@ mod tests {
                     .answering_lid(peer.to_string())
                     .build(),
             )
+            .now_or_never()
+            .expect("uncontended answer")
         );
         assert_eq!(reg.answering_device_if_current("REFUSED", generation), None);
     }
@@ -5729,42 +5736,58 @@ mod tests {
                 .answering_lid(peer.with_device(2).to_string())
                 .build()
         };
-        assert!(!reg.accept_direct_if_current(
-            "DIRECT-ANSWER",
-            stale,
-            &creator,
-            peer.with_device(2),
-            answer()
-        ));
-        assert!(!reg.accept_direct_if_current(
-            "DIRECT-ANSWER",
-            current,
-            &peer,
-            peer.with_device(2),
-            answer()
-        ));
+        assert!(
+            !reg.accept_direct_if_current(
+                "DIRECT-ANSWER",
+                stale,
+                &creator,
+                peer.with_device(2),
+                answer()
+            )
+            .now_or_never()
+            .expect("uncontended answer")
+        );
+        assert!(
+            !reg.accept_direct_if_current(
+                "DIRECT-ANSWER",
+                current,
+                &peer,
+                peer.with_device(2),
+                answer()
+            )
+            .now_or_never()
+            .expect("uncontended answer")
+        );
         let forged_device = creator.with_device(2);
         let forged_answer = crate::voip_control::control::PeerAnswer::builder()
             .answering_lid(forged_device.to_string())
             .build();
-        assert!(!reg.accept_direct_if_current(
-            "DIRECT-ANSWER",
-            current,
-            &creator,
-            forged_device,
-            forged_answer
-        ));
+        assert!(
+            !reg.accept_direct_if_current(
+                "DIRECT-ANSWER",
+                current,
+                &creator,
+                forged_device,
+                forged_answer
+            )
+            .now_or_never()
+            .expect("uncontended answer")
+        );
         assert!(
             rx.try_recv().is_err(),
             "rejected answers never reach the current media"
         );
-        assert!(reg.accept_direct_if_current(
-            "DIRECT-ANSWER",
-            current,
-            &creator,
-            peer.with_device(2),
-            answer()
-        ));
+        assert!(
+            reg.accept_direct_if_current(
+                "DIRECT-ANSWER",
+                current,
+                &creator,
+                peer.with_device(2),
+                answer()
+            )
+            .now_or_never()
+            .expect("uncontended answer")
+        );
         assert_eq!(
             rx.try_recv().unwrap().answering_lid,
             peer.with_device(2).to_string()
@@ -5773,14 +5796,154 @@ mod tests {
         let sibling_answer = crate::voip_control::control::PeerAnswer::builder()
             .answering_lid(sibling.to_string())
             .build();
-        assert!(!reg.accept_direct_if_current(
-            "DIRECT-ANSWER",
-            current,
-            &creator,
-            sibling,
-            sibling_answer
-        ));
+        assert!(
+            !reg.accept_direct_if_current(
+                "DIRECT-ANSWER",
+                current,
+                &creator,
+                sibling,
+                sibling_answer
+            )
+            .now_or_never()
+            .expect("uncontended answer")
+        );
         assert!(rx.try_recv().is_err(), "first answering device wins");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_direct_answers_wait_for_backend_acceptance_and_keep_their_generation() {
+        use crate::voip_control::fake_backend::FakeMediaSession;
+        use crate::voip_control::{MediaCloseReason, MediaEvent, MediaStats};
+        use futures::executor::block_on;
+        use std::sync::mpsc;
+
+        struct GatedAnswerMedia {
+            inner: Arc<FakeMediaSession>,
+            first: Mutex<Option<Box<dyn FnOnce() -> bool + Send>>>,
+        }
+        impl VoipMediaSession for GatedAnswerMedia {
+            fn submit(&self, command: MediaCommand) -> bool {
+                let first = self.first.lock().unwrap().take();
+                if first.is_some_and(|first| !first()) {
+                    return false;
+                }
+                self.inner.submit(command)
+            }
+            fn group_update_fits(&self, update: &GroupCallUpdate, is_call_link: bool) -> bool {
+                self.inner.group_update_fits(update, is_call_link)
+            }
+            fn stats(&self) -> MediaStats {
+                self.inner.stats()
+            }
+            fn subscribe(&self) -> async_channel::Receiver<MediaEvent> {
+                self.inner.subscribe()
+            }
+            fn close(&self, reason: MediaCloseReason) {
+                self.inner.close(reason);
+            }
+        }
+
+        for first_accepted in [false, true] {
+            for replaced_while_pending in [false, true] {
+                let reg = CallRegistry::new();
+                let peer = Jid::new("222222222222222", Server::Lid);
+                let creator = Jid::new("111111111111111", Server::Lid);
+                let generation = reg.insert(session("PENDING-ANSWER"));
+                let (media, _) = FakeMediaSession::new_with_key(MediaSessionKey {
+                    call_id: "PENDING-ANSWER".into(),
+                    generation,
+                });
+                let (entered, entered_rx) = mpsc::channel();
+                let (release, release_rx) = mpsc::channel();
+                reg.active_calls().get_mut("PENDING-ANSWER").unwrap().media =
+                    Some(Arc::new(GatedAnswerMedia {
+                        inner: media.clone(),
+                        first: Mutex::new(Some(Box::new(move || {
+                            entered.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            first_accepted
+                        }))),
+                    }));
+                let answer = |device: &Jid| {
+                    crate::voip_control::control::PeerAnswer::builder()
+                        .answering_lid(device.to_string())
+                        .build()
+                };
+                let first_device = peer.with_device(2);
+                let second_device = peer.with_device(3);
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(|| {
+                        block_on(reg.accept_direct_if_current(
+                            "PENDING-ANSWER",
+                            generation,
+                            &creator,
+                            first_device.clone(),
+                            answer(&first_device),
+                        ))
+                    });
+                    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_eq!(
+                        reg.answering_device_if_current("PENDING-ANSWER", generation),
+                        None,
+                        "the registry stays readable and exposes no provisional winner"
+                    );
+                    let mut second = std::pin::pin!(reg.accept_direct_if_current(
+                        "PENDING-ANSWER",
+                        generation,
+                        &creator,
+                        second_device.clone(),
+                        answer(&second_device),
+                    ));
+                    assert!(
+                        second.as_mut().now_or_never().is_none(),
+                        "a contender must wait instead of being discarded"
+                    );
+                    let replacement = replaced_while_pending.then(|| {
+                        let current = reg.insert(session("PENDING-ANSWER"));
+                        assert!(
+                            reg.accept_direct_if_current(
+                                "PENDING-ANSWER",
+                                current,
+                                &creator,
+                                peer.with_device(4),
+                                answer(&peer.with_device(4)),
+                            )
+                            .now_or_never()
+                            .expect("a replacement has its own transition lock")
+                        );
+                        current
+                    });
+                    release.send(()).unwrap();
+                    assert_eq!(
+                        first.join().unwrap(),
+                        first_accepted && replacement.is_none()
+                    );
+                    assert_eq!(block_on(second), !first_accepted && replacement.is_none());
+                    let (current, expected) = if let Some(current) = replacement {
+                        (current, peer.with_device(4))
+                    } else {
+                        (
+                            generation,
+                            if first_accepted {
+                                first_device.clone()
+                            } else {
+                                second_device.clone()
+                            },
+                        )
+                    };
+                    assert_eq!(
+                        reg.answering_device_if_current("PENDING-ANSWER", current),
+                        Some(expected)
+                    );
+                    assert_eq!(
+                        media.record().commands.len(),
+                        usize::from(first_accepted || replacement.is_none()),
+                        "only an accepted answer reaches its captured media"
+                    );
+                });
+            }
+        }
     }
 
     #[test]
