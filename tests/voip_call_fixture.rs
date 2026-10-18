@@ -345,6 +345,13 @@ async fn cancelling_the_real_builder_reaps_its_pending_offer() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let starting = start(&fixture);
     let offer = fixture.next_offer().await?;
+    let stanza_id = offer
+        .stanza()
+        .as_node_ref()
+        .attrs()
+        .optional_string("id")
+        .unwrap()
+        .into_owned();
     let id = offer
         .stanza()
         .as_node_ref()
@@ -364,10 +371,19 @@ async fn cancelling_the_real_builder_reaps_its_pending_offer() -> Result<()> {
             .is_cancelled()
     );
     assert!(fixture.call_snapshot(&id).is_none());
-    assert!(
-        offer.complete().is_err(),
-        "the cancelled transport cannot resume setup"
-    );
+    // NoiseSocket owns an already queued transport write independently of its caller.
+    // Its late success/ACK must not resurrect the cancelled generation.
+    offer.complete()?;
+    fixture
+        .inject(
+            NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "offer")
+                .attr("id", stanza_id)
+                .build(),
+        )
+        .await?;
+    assert!(fixture.call_snapshot(&id).is_none());
     fixture.shutdown().await?;
     Ok(())
 }
