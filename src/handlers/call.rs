@@ -1961,15 +1961,7 @@ mod tests {
             Jid::new("222222222222222", Server::Lid),
             fake_caller_lid(),
             Jid::new("OTHER-CALL", Server::Call),
-            Jid::new("CALL-ID-0001", Server::Call).with_device(4),
-            Jid {
-                agent: 1,
-                ..Jid::new("CALL-ID-0001", Server::Call)
-            },
-            Jid {
-                integrator: 1,
-                ..Jid::new("CALL-ID-0001", Server::Call)
-            },
+            Jid::new("CALL-ID-0001", Server::Lid),
         ] {
             let accept = NodeBuilder::new("call")
                 .attr("from", sender)
@@ -2159,6 +2151,20 @@ mod tests {
             &Jid::new(call_id, Server::Call).with_device(2),
             call_id
         ));
+        // These in-memory fields are not retained by JID_PAIR marshaling on @call, so exercise
+        // the exact-address predicate directly rather than normalizing a forged fixture away.
+        for sender in [
+            Jid {
+                agent: 1,
+                ..Jid::new(call_id, Server::Call)
+            },
+            Jid {
+                integrator: 1,
+                ..Jid::new(call_id, Server::Call)
+            },
+        ] {
+            assert!(!is_call_service_sender(&sender, call_id));
+        }
     }
 
     #[cfg(feature = "voip-control")]
