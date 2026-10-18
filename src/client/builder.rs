@@ -104,7 +104,9 @@ pub enum ClientBuilderError {
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("plugin task-drain timeout must be greater than zero")]
     InvalidPluginTaskDrainTimeout,
-    #[error("the configured backend does not support the inbound durability hook: {0}")]
+    #[error(
+        "the configured backend does not support the pending-inbound journal required by durability hooks: {0}"
+    )]
     UnsupportedDurabilityBackend(String),
     /// Two media backends were installed, or one was installed after assembly already bound the
     /// registry's. Silently ignoring the requested backend would leave a caller running on one it

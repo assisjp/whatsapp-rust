@@ -25,11 +25,17 @@ impl HistorySyncKey {
 /// Opt-in durable notification recovery, independent of [`crate::HistorySyncCaptureHook`].
 ///
 /// The SDK first stores the decrypted protocol-message carrier in its bounded
-/// pending-inbound journal, then awaits these hooks and successful history
-/// parsing before acknowledging the notification. Server redelivery replays the
-/// journal without repeating Signal decryption. The host can also replay its
-/// retained notification through [`crate::Client::replay_history_sync_notification`]
-/// after a restart, without depending on server redelivery or journal expiry.
+/// pending-inbound journal, then awaits `on_notification` and admission to the
+/// bounded history work queue before acknowledging the message carrier. Queue
+/// saturation or capture failure keeps the journal for server redelivery without
+/// repeating Signal decryption. Downloads run on the history worker, sharing its
+/// two-task limit with explicit replay; the `hist_sync` receipt additionally
+/// waits for `on_compressed_chunk` and successful parsing.
+///
+/// After the carrier ACK, the host owns recovery if the worker fails or the
+/// process stops. Keep the notification and schedule retries through
+/// [`crate::Client::replay_history_sync_notification`] until the chunk is durable;
+/// do not depend on server redelivery or the SDK journal surviving its cleanup.
 ///
 /// Implementations must commit before returning `Ok`, be idempotent, and reject
 /// an existing key with different bytes. Callbacks can repeat after failure,
@@ -44,8 +50,9 @@ impl HistorySyncKey {
 /// for encrypted messages, even without that hook; unsupported backends fail
 /// construction. No live-message consumer hook is installed implicitly.
 ///
-/// Calls run in the receive commit pipeline and backpressure it. Do not call
-/// blocking client operations from a hook. Failed pending writes remain in
+/// `on_notification` backpressures the receive commit pipeline; chunk callbacks
+/// run on the history worker or a host replay. Do not call blocking client
+/// operations from a hook. Failed pending writes remain in
 /// bounded resident retention for this Client; surviving process termination
 /// requires either the journal or the host notification write to have committed.
 /// Durability strength depends on the selected backend/storage configuration.

@@ -9,6 +9,8 @@ use wacore::messages::DetachedHistorySyncNotification;
 pub(crate) struct HistorySyncActivity {
     state: Mutex<HistorySyncActivityState>,
     idle_notifier: event_listener::Event,
+    /// Shared by the worker and explicit host replay, never reset on reconnect.
+    pub(crate) processing_permits: Arc<async_lock::Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -36,6 +38,7 @@ impl HistorySyncActivity {
         Self {
             state: Mutex::new(HistorySyncActivityState::default()),
             idle_notifier: event_listener::Event::new(),
+            processing_permits: Arc::new(async_lock::Semaphore::new(2)),
         }
     }
 
@@ -51,6 +54,8 @@ impl HistorySyncActivity {
             activity: Arc::clone(self),
             generation,
             payload_bytes,
+            durable_key: None,
+            processing_permit: None,
         }
     }
 
@@ -112,9 +117,31 @@ pub struct HistorySyncTaskTracker {
     activity: Arc<HistorySyncActivity>,
     generation: HistorySyncGeneration,
     payload_bytes: usize,
+    // Recovery context follows this one task through the existing public queue
+    // shape. It must not be keyed globally by the non-unique stanza ID.
+    durable_key: Option<Box<crate::HistorySyncKey>>,
+    // A blocking parser/encoder keeps a lease after its async caller is
+    // cancelled, so detached CPU work still occupies the shared two-task limit.
+    processing_permit: Option<Arc<async_lock::SemaphoreGuardArc>>,
 }
 
 impl HistorySyncTaskTracker {
+    pub(crate) fn set_processing_permit(&mut self, permit: async_lock::SemaphoreGuardArc) {
+        self.processing_permit = Some(Arc::new(permit));
+    }
+
+    pub(crate) fn processing_permit(&self) -> Option<Arc<async_lock::SemaphoreGuardArc>> {
+        self.processing_permit.clone()
+    }
+
+    pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
+        self.durable_key = Some(Box::new(key));
+    }
+
+    pub(crate) fn take_durable_key(&mut self) -> Option<Box<crate::HistorySyncKey>> {
+        self.durable_key.take()
+    }
+
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {
         let mut state = self.activity.state_guard();
         if state.generation != self.generation {
@@ -148,6 +175,7 @@ impl std::fmt::Debug for HistorySyncTaskTracker {
 
 impl Drop for HistorySyncTaskTracker {
     fn drop(&mut self) {
+        drop(self.processing_permit.take());
         self.activity.release(self.generation, self.payload_bytes);
     }
 }
