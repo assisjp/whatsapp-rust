@@ -2528,6 +2528,11 @@ pub(crate) async fn attach_outgoing_relay(
         );
         let ctx = wacore::voip_control::MediaOpenContext::builder()
             .audio(pending.audio.clone().into_ports())
+            .on_media_connected(
+                client
+                    .call_registry()
+                    .direct_media_connected_hook(spec.key.clone()),
+            )
             .video_channels(video_channels)
             .video_teardown(pending.video_teardown)
             // Re-read at open time, not parked at registration: a rotation the peer announced
@@ -3052,6 +3057,7 @@ async fn open_registered_media(
 
     let ctx = wacore::voip_control::MediaOpenContext::builder()
         .audio(audio.into_ports())
+        .on_media_connected(registry.direct_media_connected_hook(spec.key.clone()))
         .video_channels(
             wacore::voip_control::MediaVideoChannels::builder()
                 .control(video_ctl)
@@ -3680,6 +3686,19 @@ impl CallHandle {
     pub fn phase(&self) -> Option<CallPhase> {
         self.client_registry
             .phase_if_current(&self.call_id, self.generation)
+    }
+
+    /// Whether this direct call has reached accepted media readiness.
+    ///
+    /// Readiness means a constructed media plane and an allocated relay, plus validated acceptance
+    /// and installed receive keys for an outgoing call (or sent acceptance for an incoming call).
+    /// It does not prove that RTP arrived or audio was heard. The snapshot survives event queue
+    /// backpressure and stays true across relay reconnects until this generation ends, is replaced,
+    /// or becomes a group call. An external backend must invoke `MediaOpenContext::on_media_connected`
+    /// to publish readiness. False before readiness and for group calls.
+    pub fn media_connected(&self) -> bool {
+        self.client_registry
+            .media_connected_if_current(&self.call_id, self.generation)
     }
 
     /// Media counters for this call: what arrived, what was discarded, and where.
@@ -7624,6 +7643,54 @@ mod tests {
             ended: Arc::new(EndedFlag::default()),
             media: None,
         }
+    }
+
+    #[tokio::test]
+    async fn media_readiness_is_retained_without_consuming_events_and_cannot_cross_generations() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let cloned = handle.clone();
+        let media = registry
+            .resident_session(handle.call_id(), generation)
+            .unwrap();
+        let sender = media.event_sender();
+        while sender.try_send(CallEvent::RelayAllocated).is_ok() {}
+        let queued = sender.len();
+        let stats = media.install_fresh_stats_cell();
+        stats.on_media_connected(
+            registry.direct_media_connected_hook(
+                wacore::voip_control::MediaSessionKey::builder()
+                    .call_id(handle.call_id().to_owned())
+                    .generation(generation)
+                    .build(),
+            ),
+        );
+        assert!(!handle.media_connected());
+        stats.notify_media_connected();
+        assert!(handle.media_connected());
+        assert!(cloned.media_connected());
+        assert_eq!(handle.phase(), Some(CallPhase::Active));
+        assert_eq!(
+            sender.len(),
+            queued,
+            "lifecycle never consumes the public queue"
+        );
+        assert!(registry.transition_if_current(handle.call_id(), generation, CallPhase::Ended));
+        assert!(
+            !handle.media_connected(),
+            "a terminal generation is no longer ready before removal"
+        );
+        assert!(!registry.direct_media_connected_if_current(handle.call_id(), generation));
+        assert_eq!(handle.phase(), Some(CallPhase::Ended));
+        let replacement_generation = registry.insert(mk_session());
+        let replacement = registry_handle(&client, replacement_generation);
+        stats.notify_media_connected();
+        assert!(!handle.media_connected());
+        assert!(!replacement.media_connected());
+        assert_eq!(replacement.phase(), Some(CallPhase::Ringing));
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
