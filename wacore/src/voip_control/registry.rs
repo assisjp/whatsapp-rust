@@ -3053,6 +3053,55 @@ impl CallRegistry {
         }
     }
 
+    /// Commit a verified direct outgoing answer against its original generation. Identities must
+    /// already be canonicalized using the client's trusted PN/LID mapping. The captured media
+    /// belongs to this generation, so a replacement racing delivery never receives these keys.
+    pub fn accept_direct_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        creator: &Jid,
+        device: Jid,
+        answer: crate::voip_control::control::PeerAnswer,
+    ) -> bool {
+        if answer.answering_lid != device.to_string() {
+            return false;
+        }
+        let media = {
+            let mut map = self.active_calls();
+            let Some(entry) = map.get_mut(call_id).filter(|entry| {
+                entry.generation == generation
+                    && !entry.is_group_call
+                    && entry.session.direction == crate::voip_control::CallDirection::Outgoing
+                    && entry.session.call_creator.to_non_ad() == creator.to_non_ad()
+                    && entry.session.peer_jid.to_non_ad() == device.to_non_ad()
+                    && entry.session.answering_device.is_none()
+            }) else {
+                return false;
+            };
+            entry.session.answering_device = Some(device.clone());
+            entry.media.clone()
+        };
+        let delivered = media.is_some_and(|media| {
+            media.submit(MediaCommand::RekeyRecv {
+                answering_lid: answer.answering_lid,
+                audio_codec: answer.audio_codec,
+            })
+        });
+        if !delivered {
+            // A backend may refuse a command. Release only this reservation, outside the backend
+            // call: external submit implementations must never run under the registry mutex.
+            let mut map = self.active_calls();
+            if let Some(entry) = map.get_mut(call_id)
+                && entry.generation == generation
+                && entry.session.answering_device.as_ref() == Some(&device)
+            {
+                entry.session.answering_device = None;
+            }
+        }
+        delivered
+    }
+
     /// Caller side: record the callee device that answered (the inbound `<accept>`'s `call.from`), so a
     /// later `<terminate>` can target it instead of the bare peer the offer rang. Set-once -- the first
     /// answerer wins, matching the rekey and WA Web's accepted-elsewhere handling. No-op if the call is
@@ -5560,6 +5609,105 @@ mod tests {
             "a stale generation must not read the replacement's device"
         );
         assert_eq!(reg.answering_device_if_current("CID", g2), None);
+    }
+
+    #[test]
+    fn refused_direct_rekey_does_not_latch_an_answering_device() {
+        let reg = CallRegistry::new();
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let generation = reg.insert(CallSession::new_outgoing(
+            "REFUSED",
+            peer.clone(),
+            creator.clone(),
+        ));
+        reg.media_session("REFUSED", generation)
+            .unwrap()
+            .close(crate::voip_control::MediaCloseReason::Local);
+        assert!(
+            !reg.accept_direct_if_current(
+                "REFUSED",
+                generation,
+                &creator,
+                peer.clone(),
+                crate::voip_control::control::PeerAnswer::builder()
+                    .answering_lid(peer.to_string())
+                    .build(),
+            )
+        );
+        assert_eq!(reg.answering_device_if_current("REFUSED", generation), None);
+    }
+
+    #[test]
+    fn direct_accept_rejects_forged_identities_and_stale_generations() {
+        let reg = CallRegistry::new();
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let session = || CallSession::new_outgoing("DIRECT-ANSWER", peer.clone(), creator.clone());
+        let stale = reg.insert(session());
+        let current = reg.insert(session());
+        let rx = reg
+            .resident_session("DIRECT-ANSWER", current)
+            .unwrap()
+            .take_rekey_receiver()
+            .unwrap();
+        let answer = || {
+            crate::voip_control::control::PeerAnswer::builder()
+                .answering_lid(peer.with_device(2).to_string())
+                .build()
+        };
+        assert!(!reg.accept_direct_if_current(
+            "DIRECT-ANSWER",
+            stale,
+            &creator,
+            peer.with_device(2),
+            answer()
+        ));
+        assert!(!reg.accept_direct_if_current(
+            "DIRECT-ANSWER",
+            current,
+            &peer,
+            peer.with_device(2),
+            answer()
+        ));
+        let forged_device = creator.with_device(2);
+        let forged_answer = crate::voip_control::control::PeerAnswer::builder()
+            .answering_lid(forged_device.to_string())
+            .build();
+        assert!(!reg.accept_direct_if_current(
+            "DIRECT-ANSWER",
+            current,
+            &creator,
+            forged_device,
+            forged_answer
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected answers never reach the current media"
+        );
+        assert!(reg.accept_direct_if_current(
+            "DIRECT-ANSWER",
+            current,
+            &creator,
+            peer.with_device(2),
+            answer()
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap().answering_lid,
+            peer.with_device(2).to_string()
+        );
+        let sibling = peer.with_device(3);
+        let sibling_answer = crate::voip_control::control::PeerAnswer::builder()
+            .answering_lid(sibling.to_string())
+            .build();
+        assert!(!reg.accept_direct_if_current(
+            "DIRECT-ANSWER",
+            current,
+            &creator,
+            sibling,
+            sibling_answer
+        ));
+        assert!(rx.try_recv().is_err(), "first answering device wins");
     }
 
     #[test]

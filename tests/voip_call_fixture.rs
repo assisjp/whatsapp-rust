@@ -294,12 +294,21 @@ async fn initial_peer_survives_phone_cache_loss_and_early_spoofed_winner() -> Re
             let fixture = fixture.clone();
             async move { fixture.inject(accept).await }
         });
+        // Preserve the initial-peer/cache-loss regression while rejecting the old characterization
+        // of a foreign identity as the winner. Only a peer-authenticated accept may select it.
+        let injection = if spoofed {
+            injection.await??;
+            None
+        } else {
+            Some(injection)
+        };
+        let expected = (!spoofed).then_some(&winner);
         tokio::time::timeout(Duration::from_secs(1), async {
             while fixture
                 .call_snapshot(&id)
                 .and_then(|session| session.answering_device)
                 .as_ref()
-                != Some(&winner)
+                != expected
             {
                 tokio::task::yield_now().await;
             }
@@ -308,8 +317,13 @@ async fn initial_peer_survives_phone_cache_loss_and_early_spoofed_winner() -> Re
         assert!(!starting.is_finished());
         offer.complete()?;
         let handle = starting.await??;
-        injection.await??;
-        assert_eq!(handle.peer_jid(), winner);
+        if let Some(injection) = injection {
+            injection.await??;
+        }
+        assert_eq!(
+            handle.peer_jid(),
+            expected.unwrap_or(fixture.peer()).clone()
+        );
         assert_eq!(handle.initial_peer_jid(), fixture.peer());
         assert_eq!(handle.clone().initial_peer_jid(), fixture.peer());
         assert!(
@@ -426,7 +440,7 @@ async fn busy_sibling_keeps_ringing_but_late_nonbusy_reject_currently_ends_winne
 }
 
 #[tokio::test]
-async fn current_handler_accepts_an_unrung_device_as_first_winner() -> Result<()> {
+async fn direct_accept_rejects_a_foreign_user_as_first_winner() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let handle = dormant(&fixture).await?;
     let uninvited = Jid::new("444444444444444", Server::Lid).with_device(7);
@@ -441,8 +455,8 @@ async fn current_handler_accepts_an_unrung_device_as_first_winner() -> Result<()
         .await?;
     assert_eq!(
         handle.peer_jid(),
-        uninvited,
-        "characterize the handler, do not invent authorization in the fixture"
+        *fixture.peer(),
+        "the production handler must reject a different user's answer"
     );
     fixture.shutdown().await?;
     Ok(())
