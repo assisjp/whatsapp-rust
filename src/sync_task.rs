@@ -11,6 +11,8 @@ pub(crate) struct HistorySyncActivity {
     idle_notifier: event_listener::Event,
     /// Shared by the worker and explicit host replay, never reset on reconnect.
     pub(crate) processing_permits: Arc<async_lock::Semaphore>,
+    /// Replays take this first, leaving global capacity for the sync worker.
+    pub(crate) replay_permits: Arc<async_lock::Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,6 +41,7 @@ impl HistorySyncActivity {
             state: Mutex::new(HistorySyncActivityState::default()),
             idle_notifier: event_listener::Event::new(),
             processing_permits: Arc::new(async_lock::Semaphore::new(2)),
+            replay_permits: Arc::new(async_lock::Semaphore::new(1)),
         }
     }
 
@@ -55,7 +58,7 @@ impl HistorySyncActivity {
             generation,
             payload_bytes,
             durable_key: None,
-            processing_permit: None,
+            processing_permits: None,
         }
     }
 
@@ -121,17 +124,30 @@ pub struct HistorySyncTaskTracker {
     // shape. It must not be keyed globally by the non-unique stanza ID.
     durable_key: Option<Box<crate::HistorySyncKey>>,
     // A blocking parser/encoder keeps a lease after its async caller is
-    // cancelled, so detached CPU work still occupies the shared two-task limit.
-    processing_permit: Option<Arc<async_lock::SemaphoreGuardArc>>,
+    // cancelled. Keep both limits in one lease so a detached replay cannot
+    // release its replay slot while still occupying global processing capacity.
+    processing_permits: Option<Arc<HistorySyncProcessingPermits>>,
+}
+
+pub(crate) struct HistorySyncProcessingPermits {
+    _processing: async_lock::SemaphoreGuardArc,
+    _replay: Option<async_lock::SemaphoreGuardArc>,
 }
 
 impl HistorySyncTaskTracker {
-    pub(crate) fn set_processing_permit(&mut self, permit: async_lock::SemaphoreGuardArc) {
-        self.processing_permit = Some(Arc::new(permit));
+    pub(crate) fn set_processing_permits(
+        &mut self,
+        processing: async_lock::SemaphoreGuardArc,
+        replay: Option<async_lock::SemaphoreGuardArc>,
+    ) {
+        self.processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
+            _processing: processing,
+            _replay: replay,
+        }));
     }
 
-    pub(crate) fn processing_permit(&self) -> Option<Arc<async_lock::SemaphoreGuardArc>> {
-        self.processing_permit.clone()
+    pub(crate) fn processing_permits(&self) -> Option<Arc<HistorySyncProcessingPermits>> {
+        self.processing_permits.clone()
     }
 
     pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
@@ -175,7 +191,7 @@ impl std::fmt::Debug for HistorySyncTaskTracker {
 
 impl Drop for HistorySyncTaskTracker {
     fn drop(&mut self) {
-        drop(self.processing_permit.take());
+        drop(self.processing_permits.take());
         self.activity.release(self.generation, self.payload_bytes);
     }
 }

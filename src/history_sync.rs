@@ -312,8 +312,13 @@ impl Client {
             "history notification does not belong to this Client account"
         );
         drop(identity);
-        // Acquire before decoding: callers may replay many large inline blobs
-        // concurrently, and the decoded copies belong to the SDK's budget.
+        // Reserve replay capacity before the shared pool so waiting replays
+        // cannot occupy the slot needed to drain the normal sync queue. Both
+        // limits precede decoding, whose inline copies belong to our budget.
+        let replay_permit = self
+            .acquire_history_sync_semaphore(&self.history_sync_activity.replay_permits)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
         let permit = self
             .acquire_history_sync_permit()
             .await
@@ -322,7 +327,7 @@ impl Client {
         let notification: DetachedHistorySyncNotification = notification.into();
         let mut tracker = self
             .begin_history_sync_task(notification.inline_payload.as_ref().map_or(0, Bytes::len));
-        tracker.set_processing_permit(permit);
+        tracker.set_processing_permits(permit, Some(replay_permit));
         let Some((notification, mut tracker)) = self
             .capture_history_sync_notification(key, notification, tracker)
             .await?
@@ -448,6 +453,14 @@ impl Client {
     pub(crate) async fn acquire_history_sync_permit(
         &self,
     ) -> Option<async_lock::SemaphoreGuardArc> {
+        self.acquire_history_sync_semaphore(&self.history_sync_activity.processing_permits)
+            .await
+    }
+
+    async fn acquire_history_sync_semaphore(
+        &self,
+        semaphore: &Arc<async_lock::Semaphore>,
+    ) -> Option<async_lock::SemaphoreGuardArc> {
         use futures::FutureExt as _;
         loop {
             let state_changed = self.session_state_notifier.listen();
@@ -456,7 +469,7 @@ impl Client {
             }
             futures::select_biased! {
                 _ = state_changed.fuse() => {},
-                permit = self.history_sync_activity.processing_permits.acquire_arc().fuse() => {
+                permit = semaphore.acquire_arc().fuse() => {
                     return (!self.is_permanently_stopped()).then_some(permit);
                 },
             }
@@ -567,7 +580,7 @@ impl Client {
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
         permit: async_lock::SemaphoreGuardArc,
     ) {
-        tracker.set_processing_permit(permit);
+        tracker.set_processing_permits(permit, None);
         let key = tracker.take_durable_key();
         self.process_history_sync_task_inner(message_id, notification, tracker, key.as_deref())
             .await;
@@ -751,9 +764,9 @@ impl Client {
             Some((result, secret_collector.into_entries()))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
-            let processing_permit = tracker.processing_permit();
+            let processing_permits = tracker.processing_permits();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let _permit = processing_permit;
+                let _permits = processing_permits;
                 let result = process_history_sync_bytes_with_record_sink(
                     compressed_data,
                     own_user.as_deref(),

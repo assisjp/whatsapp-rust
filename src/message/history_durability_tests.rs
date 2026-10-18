@@ -675,6 +675,62 @@ async fn durable_history_worker_and_replay_share_two_permits_and_cancellation_re
 }
 
 #[tokio::test]
+async fn durable_history_two_replays_leave_capacity_for_normal_sync_intake() {
+    let (client, hook, _) = memory_client().await;
+    hook.require_journal.store(false, Ordering::SeqCst);
+    hook.chunk_parked.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+            client
+                .replay_history_sync_notification(&key(&info("FIRST_REPLAY")), &bytes)
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        hook.chunk_entered.notified(),
+    )
+    .await
+    .unwrap();
+
+    let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+    let second_key = key(&info("SECOND_REPLAY"));
+    let mut second = Box::pin(client.replay_history_sync_notification(&second_key, &bytes));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 1);
+
+    // The first replay remains blocked in its hook while normal intake drains.
+    hook.chunk_parked.store(false, Ordering::SeqCst);
+    let normal = info("NORMAL_WITH_REPLAY_BACKLOG");
+    let receipt = client.wait_for_sent_node(
+        crate::client::NodeFilter::tag("receipt")
+            .attr("type", "hist_sync")
+            .attr("id", normal.id.to_string()),
+    );
+    assert!(receive(&client, &normal, notification()).await);
+    tokio::time::timeout(std::time::Duration::from_secs(5), receipt)
+        .await
+        .expect("normal history must finish while both replay futures remain pending")
+        .unwrap();
+    assert!(pending(&client, &normal).await.is_none());
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 2);
+    assert_eq!(hook.chunks.load(Ordering::SeqCst), 2);
+    assert!(!first.is_finished());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+
+    hook.chunk_gate.notify_one();
+    first.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap();
+    history_idle(&client).await;
+    assert_eq!(hook.chunks.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_a_permit() {
     let (client, hook, _) = memory_client().await;
     let first = client.acquire_history_sync_permit().await.unwrap();
@@ -701,9 +757,33 @@ async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_a_perm
     drop((first, second));
 }
 
+#[tokio::test]
+async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_replay_capacity() {
+    let (client, hook, _) = memory_client().await;
+    let permit = client
+        .history_sync_activity
+        .replay_permits
+        .acquire_arc()
+        .await;
+    let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+    let replay_key = key(&info("TERMINAL_REPLAY_CAPACITY"));
+    let mut replay = Box::pin(client.replay_history_sync_notification(&replay_key, &bytes));
+    assert!(futures::poll!(replay.as_mut()).is_pending());
+    client.signal_shutdown_sync();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), replay)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
+    drop(permit);
+}
+
 struct ParkedEncodingRuntime {
     entered: Arc<tokio::sync::Notify>,
     release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    skip_first: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -727,6 +807,9 @@ impl wacore::runtime::Runtime for ParkedEncodingRuntime {
         &self,
         f: Box<dyn FnOnce() + Send + 'static>,
     ) -> wacore::runtime::BoxFuture<'static, ()> {
+        if self.skip_first.swap(false, Ordering::SeqCst) {
+            return crate::runtime_impl::TokioRuntime.spawn_blocking(f);
+        }
         let release = self.release.lock().unwrap().take().unwrap();
         let entered = self.entered.clone();
         let executor_thread = std::thread::current().id();
@@ -752,6 +835,7 @@ async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked
         let runtime = Arc::new(ParkedEncodingRuntime {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Mutex::new(Some(gate)),
+            skip_first: AtomicBool::new(false),
         });
         let (client, hook, transport, receiver) = client_with_runtime(
             Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
@@ -815,6 +899,7 @@ async fn durable_history_cancelled_replay_keeps_permit_until_blocking_encoding_f
     let runtime = Arc::new(ParkedEncodingRuntime {
         entered: Arc::new(tokio::sync::Notify::new()),
         release: Mutex::new(Some(gate)),
+        skip_first: AtomicBool::new(false),
     });
     let (client, hook, _, _) = client_with_runtime(
         Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
@@ -865,4 +950,89 @@ async fn durable_history_cancelled_replay_keeps_permit_until_blocking_encoding_f
     );
     assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
     drop(spare);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_until_cpu_finishes() {
+    for parsing in [false, true] {
+        let (release, gate) = std::sync::mpsc::channel();
+        let runtime = Arc::new(ParkedEncodingRuntime {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Mutex::new(Some(gate)),
+            skip_first: AtomicBool::new(parsing),
+        });
+        let (client, hook, _, receiver) = client_with_runtime(
+            Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
+            runtime.clone(),
+        )
+        .await;
+        client.start_sync_task_worker(receiver);
+        hook.require_journal.store(false, Ordering::SeqCst);
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let mut notification = notification();
+                notification.initial_hist_bootstrap_inline_payload = Some(vec![0xa5; 1024 * 1024]);
+                let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+                client
+                    .replay_history_sync_notification(&key(&info("CANCEL_CPU")), &bytes)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.entered.notified(),
+        )
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let before = hook.notifications.load(Ordering::SeqCst);
+        assert_eq!(before, usize::from(parsing));
+        let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+        let second_key = key(&info("WAITING_FOR_CPU"));
+        let mut second = Box::pin(client.replay_history_sync_notification(&second_key, &bytes));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), before);
+
+        let normal = info("NORMAL_WITH_CANCELLED_REPLAY");
+        let receipt = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("receipt")
+                .attr("type", "hist_sync")
+                .attr("id", normal.id.to_string()),
+        );
+        assert!(receive(&client, &normal, notification()).await);
+        tokio::time::timeout(std::time::Duration::from_secs(5), receipt)
+            .await
+            .expect("detached replay CPU must leave a slot for the normal worker")
+            .unwrap();
+        assert!(pending(&client, &normal).await.is_none());
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), before + 1);
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        history_idle(&client).await;
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), before + 2);
+        let first = client
+            .history_sync_activity
+            .processing_permits
+            .try_acquire_arc()
+            .unwrap();
+        let second = client
+            .history_sync_activity
+            .processing_permits
+            .try_acquire_arc()
+            .unwrap();
+        let replay = client
+            .history_sync_activity
+            .replay_permits
+            .try_acquire_arc()
+            .unwrap();
+        drop((first, second, replay));
+    }
 }
