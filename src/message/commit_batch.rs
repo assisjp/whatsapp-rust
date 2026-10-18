@@ -1816,12 +1816,15 @@ impl Client {
             // The same journal supplies these bytes on redelivery after restart.
             if self.history_sync_durability_hook.get().is_some() {
                 for delivery in pending.iter() {
-                    if let Some((_, carrier)) = &delivery.carrier
-                        && let Err(error) = Box::pin(
-                            self.commit_history_sync_carrier(&delivery.info, carrier.clone()),
-                        )
-                        .await
-                    {
+                    let Some((_, carrier)) = &delivery.carrier else {
+                        continue;
+                    };
+                    // Erase the already-boxed future so downstream Send proofs
+                    // do not traverse history capture and its traced receipts
+                    // through the send pipeline's Signal flush path.
+                    let history_commit: wacore::runtime::BoxFuture<'_, _> =
+                        Box::pin(self.commit_history_sync_carrier(&delivery.info, carrier.clone()));
+                    if let Err(error) = history_commit.await {
                         log::warn!("History sync durability failed; withholding ACK: {error:?}");
                         return PendingCommitOutcome::BUFFERED;
                     }
