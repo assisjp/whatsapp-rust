@@ -327,6 +327,38 @@ async fn initial_peer_survives_phone_cache_loss_and_early_spoofed_winner() -> Re
 }
 
 #[tokio::test]
+async fn cancelling_the_real_builder_reaps_its_pending_offer() -> Result<()> {
+    let fixture = CallFixture::new().await?;
+    let starting = start(&fixture);
+    let offer = fixture.next_offer().await?;
+    let id = offer
+        .stanza()
+        .as_node_ref()
+        .get_optional_child("offer")
+        .unwrap()
+        .attrs()
+        .optional_string("call-id")
+        .unwrap()
+        .into_owned();
+    assert!(fixture.call_snapshot(&id).is_some());
+    starting.abort();
+    assert!(
+        starting
+            .await
+            .err()
+            .expect("cancelled startup")
+            .is_cancelled()
+    );
+    assert!(fixture.call_snapshot(&id).is_none());
+    assert!(
+        offer.complete().is_err(),
+        "the cancelled transport cannot resume setup"
+    );
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn dropped_offer_refuses_send_and_dropped_fixture_reaps_a_real_handle() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let first = start(&fixture);
