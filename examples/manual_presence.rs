@@ -31,8 +31,9 @@ use anyhow::{Context, Result, ensure};
 use log::{info, warn};
 use scheduler::{Host, Notice, Settings};
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -111,11 +112,13 @@ impl Checkpoint {
 #[derive(Clone)]
 struct CheckpointStore {
     inner: Arc<tokio::sync::Mutex<Checkpoint>>,
+    owner: Arc<File>,
 }
 impl CheckpointStore {
-    fn new(directory: PathBuf) -> Self {
+    fn new(directory: PathBuf, owner: Arc<File>) -> Self {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(Checkpoint { directory })),
+            owner,
         }
     }
     async fn run<T: Send + 'static>(
@@ -126,7 +129,14 @@ impl CheckpointStore {
         // its caller cannot release admission while disk I/O is still running.
         // Subsequent retries wait asynchronously without creating more workers.
         let checkpoint = self.inner.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || operation(&checkpoint)).await?
+        let owner = self.owner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Retain exclusive ownership if bounded runtime shutdown detaches
+            // this worker: it must not write alongside a new session owner.
+            let _owner = owner;
+            operation(&checkpoint)
+        })
+        .await?
     }
     async fn load(&self) -> Result<Option<u64>> {
         self.run(Checkpoint::load).await
@@ -179,8 +189,37 @@ impl Host for Companion {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn acquire_session_lock(directory: &Path) -> Result<Arc<File>> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("presence-owner.lock"))?;
+    lock.try_lock()
+        .context("another example owns this session")?;
+    Ok(Arc::new(lock))
+}
+
+fn run_with_bounded_runtime<T>(
+    task: impl Future<Output = Result<T>>,
+    shutdown_grace: Duration,
+) -> Result<T> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(task);
+    // Started blocking I/O cannot be cancelled. Do not let runtime Drop wait
+    // forever; its worker retains the session lock until it ends/process exit.
+    runtime.shutdown_timeout(shutdown_grace);
+    result
+}
+
+fn main() -> Result<()> {
+    run_with_bounded_runtime(run_companion(), Duration::from_secs(3))
+}
+
+async fn run_companion() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let directory = PathBuf::from(
         std::env::args()
@@ -191,14 +230,7 @@ async fn main() -> Result<()> {
         directory.join("session.sqlite").is_file(),
         "pair the session before running this example"
     );
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join("presence-owner.lock"))?;
-    lock.try_lock()
-        .context("another example owns this session")?;
+    let lock = acquire_session_lock(&directory)?;
     let seconds = std::env::var("PRESENCE_PULSE_SECONDS")
         .unwrap_or_else(|_| "45".into())
         .parse::<u64>()?;
@@ -231,7 +263,7 @@ async fn main() -> Result<()> {
     let host = Companion {
         client: client.clone(),
         epoch,
-        checkpoint: CheckpointStore::new(directory),
+        checkpoint: CheckpointStore::new(directory, lock.clone()),
     };
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut handle = bot.spawn();
@@ -277,7 +309,8 @@ mod checkpoint_tests {
         use portable_atomic::{AtomicUsize, Ordering};
         let directory = std::env::temp_dir().join(format!("presence-io-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
-        let store = CheckpointStore::new(directory.clone());
+        let store =
+            CheckpointStore::new(directory.clone(), acquire_session_lock(&directory).unwrap());
         let first = store.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -317,6 +350,61 @@ mod checkpoint_tests {
             None
         );
         assert_eq!(retries_started.load(Ordering::SeqCst), 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bounded_runtime_shutdown_retains_owner_until_detached_io_finishes() {
+        let directory =
+            std::env::temp_dir().join(format!("presence-shutdown-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let store =
+            CheckpointStore::new(directory.clone(), acquire_session_lock(&directory).unwrap());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let result = run_with_bounded_runtime(
+                async move {
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        store
+                            .run(move |_| {
+                                let _ = started_tx.send(());
+                                release_rx.recv()?;
+                                Ok(())
+                            })
+                            .await
+                    });
+                    started_rx.await?;
+                    Ok(())
+                },
+                Duration::from_millis(20),
+            );
+            let _ = done_tx.send(result);
+        });
+        // Keep a broken implementation from hanging the test forever: panic
+        // drops release_tx, which releases the synthetic blocking operation.
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(acquire_session_lock(&directory).is_err());
+        release_tx.send(()).unwrap();
+        runner.join().unwrap();
+        let mut next_owner = None;
+        for _ in 0..200 {
+            if let Ok(owner) = acquire_session_lock(&directory) {
+                next_owner = Some(owner);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            next_owner.is_some(),
+            "completed I/O must release session ownership"
+        );
+        drop(next_owner);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
