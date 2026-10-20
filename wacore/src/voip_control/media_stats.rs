@@ -354,6 +354,51 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_retransmitted: now
             .video_retransmitted
             .saturating_sub(then.video_retransmitted),
+        video_access_units_completed: now
+            .video_access_units_completed
+            .saturating_sub(then.video_access_units_completed),
+        video_access_units_without_marker: now
+            .video_access_units_without_marker
+            .saturating_sub(then.video_access_units_without_marker),
+        video_access_units_empty: now
+            .video_access_units_empty
+            .saturating_sub(then.video_access_units_empty),
+        video_access_units_evicted: now
+            .video_access_units_evicted
+            .saturating_sub(then.video_access_units_evicted),
+        video_rtp_stale_timestamp: now
+            .video_rtp_stale_timestamp
+            .saturating_sub(then.video_rtp_stale_timestamp),
+        video_rtp_completed_timestamp: now
+            .video_rtp_completed_timestamp
+            .saturating_sub(then.video_rtp_completed_timestamp),
+        video_fu_dropped_sequence_gap: now
+            .video_fu_dropped_sequence_gap
+            .saturating_sub(then.video_fu_dropped_sequence_gap),
+        video_fu_dropped_timestamp_boundary: now
+            .video_fu_dropped_timestamp_boundary
+            .saturating_sub(then.video_fu_dropped_timestamp_boundary),
+        video_fu_dropped_unterminated: now
+            .video_fu_dropped_unterminated
+            .saturating_sub(then.video_fu_dropped_unterminated),
+        video_fu_orphan_fragments: now
+            .video_fu_orphan_fragments
+            .saturating_sub(then.video_fu_orphan_fragments),
+        video_nal_oversize_dropped: now
+            .video_nal_oversize_dropped
+            .saturating_sub(then.video_nal_oversize_dropped),
+        video_payload_unusable: now
+            .video_payload_unusable
+            .saturating_sub(then.video_payload_unusable),
+        video_ssrc_switches: now
+            .video_ssrc_switches
+            .saturating_sub(then.video_ssrc_switches),
+        video_ssrc_switch_partial_dropped: now
+            .video_ssrc_switch_partial_dropped
+            .saturating_sub(then.video_ssrc_switch_partial_dropped),
+        video_retired_ssrc_ignored: now
+            .video_retired_ssrc_ignored
+            .saturating_sub(then.video_retired_ssrc_ignored),
     }
 }
 

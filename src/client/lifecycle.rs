@@ -309,10 +309,16 @@ impl Client {
     /// The previous notifier's subscribers have already been woken (either
     /// by notify on disconnect, or by falling out of scope).
     pub(crate) fn reset_connection_shutdown(&self) {
-        *self
+        let mut connection = self
             .connection_shutdown
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = wacore::runtime::ShutdownNotifier::new();
+            .unwrap_or_else(|p| p.into_inner());
+        connection.notify();
+        *connection = wacore::runtime::ShutdownNotifier::new();
+        self.inbound_queues().work.reopen();
+        self.inbound_queues()
+            .draining
+            .store(false, Ordering::Release);
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -721,7 +727,7 @@ impl Client {
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
-            transport_ack_queue: std::sync::OnceLock::new(),
+            inbound_queues: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             socket_ready_notifier: event_listener::Event::new(),
             is_ready: AtomicBool::new(false),

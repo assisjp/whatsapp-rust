@@ -391,6 +391,62 @@ fn fragment_nal(nal: &[u8], out: &mut PacketizedAu) {
 /// pathological loss can't grow it without bound.
 const H264_MAX_READY_AUS: usize = 4;
 
+/// What [`H264Depacketizer`] did with its input since the last
+/// [`H264Depacketizer::take_stats`], one counter per way a picture can fail to
+/// come out of it.
+///
+/// RTP loss is counted where sequence numbers are tracked; these are the
+/// discards that happen to packets that DID arrive, which no loss counter sees.
+/// Counts only: nothing here names a packet, a stream or its contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct H264DepacketizerStats {
+    /// Access units handed out by [`H264Depacketizer::push`] or
+    /// [`H264Depacketizer::pop_ready`].
+    pub access_units_completed: u32,
+    /// Access units closed by the next timestamp rather than by their marker
+    /// packet. Still handed out, but likely missing their tail.
+    pub access_units_without_marker: u32,
+    /// Timestamps whose packets left no complete NAL by the time the next
+    /// timestamp began: a picture that produced nothing at all.
+    pub access_units_empty: u32,
+    /// Completed access units dropped from the ready queue, which holds at most
+    /// four.
+    pub access_units_evicted: u32,
+    /// Packets discarded because their timestamp is older than the access unit
+    /// being assembled or the one last completed.
+    pub packets_stale_timestamp: u32,
+    /// Packets discarded because they carry the timestamp of the access unit
+    /// their marker already completed.
+    pub packets_completed_timestamp: u32,
+    /// Partial FU-A NALs dropped because a fragment's sequence number skipped.
+    pub fu_dropped_sequence_gap: u32,
+    /// Partial FU-A NALs dropped because a new timestamp began before their end
+    /// fragment.
+    pub fu_dropped_timestamp_boundary: u32,
+    /// Partial FU-A NALs dropped because another NAL, or the access unit's
+    /// marker, arrived before their end fragment.
+    pub fu_dropped_unterminated: u32,
+    /// FU-A middle or end fragments ignored because no start fragment was on
+    /// record: it was lost, or the partial was already dropped, including by
+    /// the gap this very fragment revealed.
+    pub fu_orphan_fragments: u32,
+    /// NALs refused because they would grow a NAL or an access unit past
+    /// [`H264_MAX_AU_BYTES`].
+    pub nal_oversize_dropped: u32,
+    /// Payloads with no usable NAL: empty, NAL type 0, a type this
+    /// depacketizer does not support, or a truncated FU-A or STAP-A.
+    pub payload_unusable: u32,
+}
+
+/// Why a partial FU-A NAL is being dropped; see [`H264DepacketizerStats`].
+#[derive(Clone, Copy)]
+enum FuDrop {
+    SequenceGap,
+    TimestampBoundary,
+    Unterminated,
+    Oversize,
+}
+
 /// Reassemble RTP payloads back into Annex-B access units. Feed each payload
 /// with its RTP sequence number, timestamp, and marker bit; a completed AU is
 /// returned when its marker arrives OR when a new RTP timestamp begins the next
@@ -414,6 +470,9 @@ pub struct H264Depacketizer {
     last_completed_timestamp: Option<u32>,
     /// AUs completed but not yet returned, paired with their RTP timestamps.
     ready: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// Survives [`Self::reset`]: a reset discards reassembly state, not the
+    /// account of what happened to earlier input.
+    stats: H264DepacketizerStats,
 }
 
 impl H264Depacketizer {
@@ -426,31 +485,65 @@ impl H264Depacketizer {
         self.ready.clear();
     }
 
+    /// Whether a [`Self::reset`] now would discard input: a partial access
+    /// unit, a partial NAL, or a completed access unit not yet taken.
+    pub fn holds_partial(&self) -> bool {
+        !self.au_buf.is_empty() || self.fu_active || !self.ready.is_empty()
+    }
+
+    /// Hand back the counters accumulated since the previous call and start
+    /// them again from zero, so a caller can fold them into its own totals.
+    pub fn take_stats(&mut self) -> H264DepacketizerStats {
+        std::mem::take(&mut self.stats)
+    }
+
     fn queue_ready(&mut self, timestamp: u32, au: Vec<u8>) {
         if self.ready.len() >= H264_MAX_READY_AUS {
             self.ready.pop_front();
+            self.stats.access_units_evicted = self.stats.access_units_evicted.saturating_add(1);
         }
         self.ready.push_back((timestamp, au));
     }
 
     /// Take another completed AU while preserving its RTP timestamp.
     pub fn pop_ready(&mut self) -> Option<(u32, Vec<u8>)> {
-        self.ready.pop_front()
+        let next = self.ready.pop_front();
+        if next.is_some() {
+            self.stats.access_units_completed = self.stats.access_units_completed.saturating_add(1);
+        }
+        next
     }
 
     /// A lost end-fragment leaves a stale partial NAL; drop it rather than
     /// splice its bytes into the next NAL.
-    fn drop_partial_fu(&mut self) {
+    fn drop_partial_fu(&mut self, reason: FuDrop) {
+        if self.fu_active {
+            let counter = match reason {
+                FuDrop::SequenceGap => &mut self.stats.fu_dropped_sequence_gap,
+                FuDrop::TimestampBoundary => &mut self.stats.fu_dropped_timestamp_boundary,
+                FuDrop::Unterminated => &mut self.stats.fu_dropped_unterminated,
+                FuDrop::Oversize => &mut self.stats.nal_oversize_dropped,
+            };
+            *counter = counter.saturating_add(1);
+        }
         self.fu_buf.clear();
         self.fu_active = false;
     }
 
     fn append_nal(&mut self, nal: &[u8]) {
-        if nal.is_empty() || self.au_buf.len() + START_CODE.len() + nal.len() > H264_MAX_AU_BYTES {
+        if nal.is_empty() {
+            return;
+        }
+        if self.au_buf.len() + START_CODE.len() + nal.len() > H264_MAX_AU_BYTES {
+            self.stats.nal_oversize_dropped = self.stats.nal_oversize_dropped.saturating_add(1);
             return;
         }
         self.au_buf.extend_from_slice(&START_CODE);
         self.au_buf.extend_from_slice(nal);
+    }
+
+    fn note_unusable_payload(&mut self) {
+        self.stats.payload_unusable = self.stats.payload_unusable.saturating_add(1);
     }
 
     pub fn push(
@@ -469,14 +562,21 @@ impl H264Depacketizer {
                 if (timestamp.wrapping_sub(cur) as i32) > 0 {
                     // A timestamp boundary invalidates any partial FU, even when
                     // no complete NAL has reached the access-unit buffer yet.
-                    self.drop_partial_fu();
-                    if !self.au_buf.is_empty() {
+                    self.drop_partial_fu(FuDrop::TimestampBoundary);
+                    if self.au_buf.is_empty() {
+                        self.stats.access_units_empty =
+                            self.stats.access_units_empty.saturating_add(1);
+                    } else {
+                        self.stats.access_units_without_marker =
+                            self.stats.access_units_without_marker.saturating_add(1);
                         let au = std::mem::take(&mut self.au_buf);
                         self.queue_ready(cur, au);
                     }
                     self.last_completed_timestamp = Some(cur);
                     self.au_timestamp = Some(timestamp);
                 } else {
+                    self.stats.packets_stale_timestamp =
+                        self.stats.packets_stale_timestamp.saturating_add(1);
                     return self.pop_ready();
                 }
             }
@@ -484,23 +584,38 @@ impl H264Depacketizer {
             if let Some(completed) = self.last_completed_timestamp
                 && (timestamp.wrapping_sub(completed) as i32) <= 0
             {
+                let counter = if timestamp == completed {
+                    &mut self.stats.packets_completed_timestamp
+                } else {
+                    &mut self.stats.packets_stale_timestamp
+                };
+                *counter = counter.saturating_add(1);
                 return self.pop_ready();
             }
             self.au_timestamp = Some(timestamp);
         }
         match nal_unit_type(payload) {
             NAL_TYPE_STAP_A => {
-                self.drop_partial_fu();
+                self.drop_partial_fu(FuDrop::Unterminated);
                 let mut rest = &payload[1..];
+                let mut appended = false;
+                let mut malformed = false;
                 while rest.len() >= 2 {
                     let len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
                     rest = &rest[2..];
                     if len == 0 || len > rest.len() {
+                        malformed = true;
                         break;
                     }
                     let (nal, tail) = rest.split_at(len);
                     self.append_nal(nal);
+                    appended = true;
                     rest = tail;
+                }
+                // A header alone, a zero or lying length, or a stray trailing byte: the packet
+                // carried something it could not deliver.
+                if malformed || !appended || !rest.is_empty() {
+                    self.note_unusable_payload();
                 }
             }
             NAL_TYPE_FU_A if payload.len() >= 2 => {
@@ -508,19 +623,19 @@ impl H264Depacketizer {
                 let start = fu_header & 0x80 != 0;
                 let end = fu_header & 0x40 != 0;
                 if start {
-                    self.drop_partial_fu();
+                    self.drop_partial_fu(FuDrop::Unterminated);
                     self.fu_active = true;
                     self.fu_buf.push((payload[0] & 0xe0) | (fu_header & 0x1f));
                 } else if self.fu_active && seq != self.fu_next_seq {
                     // A lost (or reordered) fragment: the bytes on hand no longer
                     // form a prefix of the NAL, so emitting them would hand the
                     // decoder a truncated slice. Drop the partial instead.
-                    self.drop_partial_fu();
+                    self.drop_partial_fu(FuDrop::SequenceGap);
                 }
                 if self.fu_active {
                     self.fu_next_seq = seq.wrapping_add(1);
                     if self.fu_buf.len() + payload.len() > H264_MAX_AU_BYTES {
-                        self.drop_partial_fu();
+                        self.drop_partial_fu(FuDrop::Oversize);
                     } else {
                         self.fu_buf.extend_from_slice(&payload[2..]);
                         if end {
@@ -531,19 +646,23 @@ impl H264Depacketizer {
                             self.fu_buf.clear();
                         }
                     }
+                } else {
+                    // A middle fragment with no start on record means the start was
+                    // lost: ignore it and wait for the next start bit.
+                    self.stats.fu_orphan_fragments =
+                        self.stats.fu_orphan_fragments.saturating_add(1);
                 }
-                // A middle fragment with no start on record means the start was
-                // lost: ignore it and wait for the next start bit.
             }
             t if (1..=23).contains(&t) => {
-                self.drop_partial_fu();
+                self.drop_partial_fu(FuDrop::Unterminated);
                 self.append_nal(payload);
             }
-            // Type 0 (empty/garbage) and unsupported aggregation types are ignored.
-            _ => {}
+            // Type 0 (empty/garbage), a truncated FU-A and unsupported aggregation types are
+            // ignored.
+            _ => self.note_unusable_payload(),
         }
         if marker && !self.au_buf.is_empty() {
-            self.drop_partial_fu();
+            self.drop_partial_fu(FuDrop::Unterminated);
             let completed_timestamp = self.au_timestamp.take().unwrap_or(timestamp);
             self.last_completed_timestamp = Some(completed_timestamp);
             let au = std::mem::take(&mut self.au_buf);
@@ -1257,6 +1376,179 @@ mod tests {
         assert!(payloads.is_empty(), "packetize_au must clear stale output");
         let mut d = H264Depacketizer::default();
         assert_eq!(d.push(0, 0, &[], true), None);
+    }
+
+    fn fragments_of(nal_len: usize) -> PacketizedAu {
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au_from_nals(&[nal(5, nal_len)]), &mut payloads);
+        assert!(payloads.len() >= 3, "the NAL must span FU-A fragments");
+        payloads
+    }
+
+    #[test]
+    fn stats_count_completed_and_markerless_access_units() {
+        let mut d = H264Depacketizer::default();
+        assert!(d.push(0, 1000, &nal(1, 20), true).is_some());
+        // The marker of ts 2000 is lost; ts 3000 closes it.
+        assert_eq!(d.push(1, 2000, &nal(1, 20), false), None);
+        assert!(d.push(3, 3000, &nal(1, 20), true).is_some());
+        assert!(d.pop_ready().is_some());
+        let stats = d.take_stats();
+        assert_eq!(stats.access_units_completed, 3);
+        assert_eq!(stats.access_units_without_marker, 1);
+        assert_eq!(stats.access_units_empty, 0);
+        assert_eq!(d.take_stats(), H264DepacketizerStats::default());
+    }
+
+    #[test]
+    fn stats_survive_a_reset() {
+        let mut d = H264Depacketizer::default();
+        assert!(d.push(0, 1000, &nal(1, 20), true).is_some());
+        assert_eq!(d.push(1, 2000, &nal(1, 20), false), None);
+        assert!(d.holds_partial());
+        d.reset();
+        assert!(!d.holds_partial());
+        assert_eq!(d.take_stats().access_units_completed, 1);
+    }
+
+    #[test]
+    fn stats_count_a_timestamp_that_produced_nothing() {
+        let payloads = fragments_of(2_000);
+        let mut d = H264Depacketizer::default();
+        // Only the start fragment of ts 1000 arrives.
+        assert_eq!(d.push(0, 1000, &payloads[0], false), None);
+        assert!(d.push(5, 2000, &nal(1, 20), true).is_some());
+        let stats = d.take_stats();
+        assert_eq!(stats.access_units_empty, 1);
+        assert_eq!(stats.fu_dropped_timestamp_boundary, 1);
+        assert_eq!(stats.access_units_without_marker, 0);
+        assert_eq!(stats.access_units_completed, 1);
+    }
+
+    #[test]
+    fn stats_count_stale_and_completed_timestamp_packets() {
+        let mut d = H264Depacketizer::default();
+        assert!(d.push(10, 2000, &nal(1, 20), true).is_some());
+        // Older than the completed AU, and equal to it, with no AU in progress.
+        assert_eq!(d.push(5, 1000, &nal(1, 20), false), None);
+        assert_eq!(d.push(9, 2000, &nal(1, 20), false), None);
+        // Older than the AU in progress.
+        assert_eq!(d.push(11, 3000, &nal(1, 20), false), None);
+        assert_eq!(d.push(8, 2000, &nal(1, 20), false), None);
+        let stats = d.take_stats();
+        assert_eq!(stats.packets_stale_timestamp, 2);
+        assert_eq!(stats.packets_completed_timestamp, 1);
+    }
+
+    #[test]
+    fn stats_count_each_way_a_partial_fu_is_dropped() {
+        let payloads = fragments_of(3_000);
+        let mut d = H264Depacketizer::default();
+
+        // Sequence gap: start at 0, next fragment at 2. The gapped fragment is then an orphan, and
+        // so is every later fragment of that NAL.
+        assert_eq!(d.push(0, 1000, &payloads[0], false), None);
+        assert_eq!(d.push(2, 1000, &payloads[1], false), None);
+        assert_eq!(d.push(3, 1000, &payloads[2], false), None);
+        let stats = d.take_stats();
+        assert_eq!(stats.fu_dropped_sequence_gap, 1);
+        assert_eq!(stats.fu_orphan_fragments, 2);
+
+        // Unterminated: a new start, then a single NAL with the marker, each cut a partial short.
+        assert_eq!(d.push(10, 1000, &payloads[0], false), None);
+        assert_eq!(d.push(11, 1000, &payloads[0], false), None);
+        assert!(d.push(12, 1000, &nal(1, 20), true).is_some());
+        let stats = d.take_stats();
+        assert_eq!(stats.fu_dropped_unterminated, 2);
+        assert_eq!(stats.fu_dropped_sequence_gap, 0);
+
+        // Timestamp boundary.
+        assert_eq!(d.push(20, 2000, &payloads[0], false), None);
+        assert_eq!(d.push(21, 3000, &nal(1, 20), false), None);
+        assert_eq!(d.take_stats().fu_dropped_timestamp_boundary, 1);
+
+        // A complete NAL drops nothing.
+        for (i, p) in payloads.iter().enumerate() {
+            let _ = d.push(30 + i as u16, 4000, p, i == payloads.len() - 1);
+        }
+        let stats = d.take_stats();
+        assert_eq!(
+            (
+                stats.fu_dropped_sequence_gap,
+                stats.fu_dropped_unterminated,
+                stats.fu_dropped_timestamp_boundary,
+                stats.fu_orphan_fragments,
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(stats.access_units_completed, 2);
+    }
+
+    #[test]
+    fn stats_count_oversize_nals() {
+        let mut d = H264Depacketizer::default();
+        let big = nal(1, H264_MAX_AU_BYTES - 64);
+        assert_eq!(d.push(0, 1000, &big, false), None);
+        // The second NAL would push the AU past the cap.
+        assert_eq!(d.push(1, 1000, &nal(1, 128), false), None);
+        assert_eq!(d.take_stats().nal_oversize_dropped, 1);
+
+        // A fragmented NAL that grows past the cap on its own.
+        let mut d = H264Depacketizer::default();
+        let start = [0x7c, 0x85];
+        let middle = [&[0x7c, 0x05][..], &vec![0u8; 1 << 20]].concat();
+        assert_eq!(d.push(0, 1000, &start, false), None);
+        for seq in 1..=4u16 {
+            assert_eq!(d.push(seq, 1000, &middle, false), None);
+        }
+        let stats = d.take_stats();
+        assert_eq!(stats.nal_oversize_dropped, 1);
+        assert_eq!(stats.fu_dropped_sequence_gap, 0);
+    }
+
+    #[test]
+    fn stats_count_unusable_payloads() {
+        let mut d = H264Depacketizer::default();
+        let unusable: [&[u8]; 8] = [
+            &[],
+            &[0x00, 0x01],
+            &[0x7c],                   // FU-A with no header
+            &[0x7d, 0x80, 0x01],       // FU-B
+            &[0x78, 0x00, 0xff, 0xaa], // STAP-A with a lying length
+            &[0x78],                   // STAP-A header alone
+            &[0x78, 0x00, 0x05],       // STAP-A length with no bytes after it
+            &[0x78, 0x00, 0x00],       // STAP-A with a zero length
+        ];
+        for (seq, payload) in unusable.iter().enumerate() {
+            let _ = d.push(seq as u16, 1000, payload, false);
+        }
+        assert_eq!(d.take_stats().payload_unusable, 8);
+        // A well-formed STAP-A is not.
+        let mut stap = vec![0x78];
+        for n in [nal(7, 6), nal(8, 4)] {
+            stap.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            stap.extend_from_slice(&n);
+        }
+        let _ = d.push(10, 1000, &stap, false);
+        assert_eq!(d.take_stats().payload_unusable, 0);
+    }
+
+    #[test]
+    fn stats_count_ready_queue_evictions() {
+        let mut d = H264Depacketizer::default();
+        for ts in 0..(H264_MAX_READY_AUS as u32 + 2) {
+            d.queue_ready(ts, vec![0]);
+        }
+        assert_eq!(d.take_stats().access_units_evicted, 2);
+        let mut handed_out = 0;
+        while d.pop_ready().is_some() {
+            handed_out += 1;
+        }
+        assert_eq!(handed_out, H264_MAX_READY_AUS);
+        assert_eq!(
+            d.take_stats().access_units_completed,
+            H264_MAX_READY_AUS as u32
+        );
     }
 
     /// An AUD-less encoder still frames: every IDR group opens with SPS (the

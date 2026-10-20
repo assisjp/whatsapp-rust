@@ -95,6 +95,80 @@ impl StanzaHandler for CallHandler {
                 #[cfg(feature = "voip-control")]
                 let mut call = call;
                 #[cfg(feature = "voip-control")]
+                let mut direct_accept_alias = None;
+                // Bind direct answers before any await. A trusted namespace lookup may suspend;
+                // the captured generation must still own the call when its answer is committed.
+                #[cfg(feature = "voip-control")]
+                let direct_accept = if matches!(&call.action, CallAction::Accept { .. }) {
+                    let registry = client.call_registry();
+                    match registry.generation_of(call.action.call_id()) {
+                        Some(generation)
+                            if registry
+                                .is_group_call_if_current(call.action.call_id(), generation) =>
+                        {
+                            None
+                        }
+                        Some(generation) => {
+                            let Some(session) =
+                                registry.snapshot_if_current(call.action.call_id(), generation)
+                            else {
+                                return true;
+                            };
+                            if session.direction != wacore::voip_control::CallDirection::Outgoing
+                                || session.answering_device.is_some()
+                            {
+                                return true;
+                            }
+                            // Participant metadata is authoritative only inside this call's
+                            // service envelope, never on a peer-authored or foreign-call stanza.
+                            if call.participant.is_some()
+                                && !is_call_service_sender(&call.from, call.action.call_id())
+                            {
+                                return true;
+                            }
+                            let Some(sender) = canonical_call_identity(
+                                &client,
+                                &routed_call_sender(&call),
+                                &session.peer_jid,
+                            )
+                            .await
+                            else {
+                                return true;
+                            };
+                            let Some(creator) = canonical_call_identity(
+                                &client,
+                                call.action.call_creator(),
+                                &session.call_creator,
+                            )
+                            .await
+                            else {
+                                return true;
+                            };
+                            direct_accept_alias = client.swap_pn_lid_namespace(&sender).await;
+                            if !registry.is_current(call.action.call_id(), generation) {
+                                return true;
+                            }
+                            if call.participant.is_some() {
+                                call.participant = Some(sender.clone());
+                            } else {
+                                call.from = sender.clone();
+                            }
+                            Some((generation, creator, sender))
+                        }
+                        None => {
+                            // An unmanaged call has no owned state to authorize. Preserve the
+                            // signaling observation without letting it mutate a later registration.
+                            client
+                                .core
+                                .event_bus
+                                .dispatch(Event::IncomingCall(Box::new(call)));
+                            return true;
+                        }
+                    }
+                } else {
+                    None
+                };
+                #[cfg(feature = "voip-control")]
                 if matches!(
                     &call.action,
                     CallAction::GroupUpdate { update } if update.rekey_requested
@@ -103,7 +177,7 @@ impl StanzaHandler for CallHandler {
                     // transition later commits. Send it before Signal fanout can block for every
                     // participant, and suppress the router's deferred generic ACK.
                     *cancelled = true;
-                    if let Err(error) = client.send_ack_for(nr).await {
+                    if let Err(error) = client.send_ack_for(nr, None).await {
                         warn!(
                             "call: failed to acknowledge group update before epoch fanout: {error}"
                         );
@@ -335,11 +409,15 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-control")]
                     let mut peer_mlow_bit = CapabilityBit::Unknown;
                     #[cfg(feature = "voip-control")]
+                    let mut accepting_device_capability = None;
+                    #[cfg(feature = "voip-control")]
                     if matches!(
                         &call.action,
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
-                    ) && let Some(generation) =
-                        client.call_registry().generation_of(call.action.call_id())
+                    ) && let Some(generation) = direct_accept
+                        .as_ref()
+                        .map(|(generation, _, _)| *generation)
+                        .or_else(|| client.call_registry().generation_of(call.action.call_id()))
                     {
                         let capability = nr
                             .children()
@@ -358,6 +436,25 @@ impl StanzaHandler for CallHandler {
                             let bytes = capability.content_bytes().unwrap_or_default();
                             capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
                         });
+                        let mut capability_sender = routed_call_sender(&call);
+                        if matches!(&call.action, CallAction::PreAccept { .. })
+                            && !client
+                                .call_registry()
+                                .is_group_call_if_current(call.action.call_id(), generation)
+                            && let Some(session) = client
+                                .call_registry()
+                                .snapshot_if_current(call.action.call_id(), generation)
+                            && let Some(canonical) = canonical_call_identity(
+                                &client,
+                                &capability_sender,
+                                &session.peer_jid,
+                            )
+                            .await
+                        {
+                            // The accept authenticates in the session's namespace. Retain earlier
+                            // codec statements under that same trusted device identity.
+                            capability_sender = canonical;
+                        }
                         // A device states its codec capability in the `<preaccept>` and its
                         // `<accept>` need not repeat it -- a video answer omits the child by
                         // construction. Retained per device so the accept below reads what THIS
@@ -366,7 +463,7 @@ impl StanzaHandler for CallHandler {
                         client.call_registry().note_peer_capability(
                             call.action.call_id(),
                             generation,
-                            &routed_call_sender(&call),
+                            &capability_sender,
                             peer_mlow_bit,
                         );
                         let device = if let Some(capability) = capability
@@ -379,7 +476,7 @@ impl StanzaHandler for CallHandler {
                             };
                             if let Some(version) = version {
                                 Some(
-                                    GroupCallDevice::new(routed_call_sender(&call))
+                                    GroupCallDevice::new(capability_sender)
                                         .with_capability(version, bytes.to_vec()),
                                 )
                             } else {
@@ -393,21 +490,7 @@ impl StanzaHandler for CallHandler {
                             None
                         };
                         if matches!(&call.action, CallAction::Accept { .. }) {
-                            if let Some(device) = device {
-                                client.call_registry().select_group_invite_peer_device(
-                                    call.action.call_id(),
-                                    generation,
-                                    Some(device),
-                                );
-                            } else {
-                                client
-                                    .call_registry()
-                                    .select_group_invite_peer_without_capability(
-                                        call.action.call_id(),
-                                        generation,
-                                        &routed_call_sender(&call),
-                                    );
-                            }
+                            accepting_device_capability = device;
                         } else if let Some(device) = device {
                             client.call_registry().set_group_invite_peer_device(
                                 call.action.call_id(),
@@ -425,16 +508,90 @@ impl StanzaHandler for CallHandler {
                         let sender = routed_call_sender(&call);
                         // Record the device that answered so a later <terminate> targets it (call
                         // signaling is addressed per device, not to the bare peer the offer rang).
-                        client
+                        if direct_accept.is_none() {
+                            client
+                                .call_registry()
+                                .set_answering_device(call.action.call_id(), sender.clone());
+                        }
+                        // The peer's capability and the answering device land in the same stanza
+                        // and both have to be applied before the first inbound packet, so they
+                        // travel as one message rather than racing.
+                        let mut peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                            call.action.call_id(),
+                            &sender,
+                            peer_mlow_bit,
+                        );
+                        if peer_mlow_bit == CapabilityBit::Unknown
+                            && let Some(alias) = direct_accept_alias.as_ref()
+                        {
+                            // The mapping may have arrived after preaccept. Never borrow another
+                            // device's rollout bit: this trusted alias preserves the device id.
+                            peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                                call.action.call_id(),
+                                alias,
+                                CapabilityBit::Unknown,
+                            );
+                        }
+                        let audio_codec = client
                             .call_registry()
-                            .set_answering_device(call.action.call_id(), sender.clone());
+                            .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
+                        let answer = wacore::voip_control::control::PeerAnswer::builder()
+                            .answering_lid(sender.to_string())
+                            .maybe_audio_codec(audio_codec)
+                            .build();
+                        if let Some((generation, creator, device)) = direct_accept.as_ref() {
+                            if !client
+                                .call_registry()
+                                .accept_direct_if_current(
+                                    call.action.call_id(),
+                                    *generation,
+                                    creator,
+                                    device.clone(),
+                                    answer,
+                                )
+                                .await
+                            {
+                                return true;
+                            }
+                        } else {
+                            client
+                                .call_registry()
+                                .send_rekey(call.action.call_id(), answer);
+                        }
+                        // Only the answer that reached media may select promotion capabilities.
+                        // A refused or concurrent sibling answer must not latch a different device.
+                        if let Some(generation) = direct_accept
+                            .as_ref()
+                            .map(|(generation, _, _)| *generation)
+                            .or_else(|| client.call_registry().generation_of(call.action.call_id()))
+                        {
+                            if let Some(device) = accepting_device_capability {
+                                client.call_registry().select_group_invite_peer_device(
+                                    call.action.call_id(),
+                                    generation,
+                                    Some(device),
+                                );
+                            } else {
+                                client
+                                    .call_registry()
+                                    .select_group_invite_peer_without_capability(
+                                        call.action.call_id(),
+                                        generation,
+                                        &sender,
+                                    );
+                            }
+                        }
                         // The answering device's camera rotation, announced on
                         // the `<accept>`'s `<video>` and nowhere else until it
                         // turns. After `set_answering_device`, so the registry
                         // can tell a winning answer from a late sibling's.
                         if let Some(orientation) = call.video_orientation
-                            && let Some(generation) =
-                                client.call_registry().generation_of(call.action.call_id())
+                            && let Some(generation) = direct_accept
+                                .as_ref()
+                                .map(|(generation, _, _)| *generation)
+                                .or_else(|| {
+                                    client.call_registry().generation_of(call.action.call_id())
+                                })
                         {
                             client.call_registry().set_peer_video_orientation(
                                 call.action.call_id(),
@@ -443,26 +600,10 @@ impl StanzaHandler for CallHandler {
                                 orientation,
                             );
                         }
-                        // The peer's capability and the answering device land in the same stanza
-                        // and both have to be applied before the first inbound packet, so they
-                        // travel as one message rather than racing.
-                        let peer_mlow_bit = client.call_registry().resolve_peer_capability(
-                            call.action.call_id(),
-                            &sender,
-                            peer_mlow_bit,
-                        );
-                        let audio_codec = client
-                            .call_registry()
-                            .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
-                        client.call_registry().send_rekey(
-                            call.action.call_id(),
-                            wacore::voip_control::control::PeerAnswer::builder()
-                                .answering_lid(sender.to_string())
-                                .maybe_audio_codec(audio_codec)
-                                .build(),
-                        );
-                        if let Some(generation) =
-                            client.call_registry().generation_of(call.action.call_id())
+                        if let Some(generation) = direct_accept
+                            .as_ref()
+                            .map(|(generation, _, _)| *generation)
+                            .or_else(|| client.call_registry().generation_of(call.action.call_id()))
                         {
                             announce_orientation_on_accept(
                                 &client,
@@ -1480,12 +1621,28 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
 /// and the final `terminate` from it rather than from the creator's device.
 #[cfg(feature = "voip-control")]
 fn is_call_service_sender(sender: &Jid, call_id: &str) -> bool {
-    sender.server == Server::Call && sender.device == 0 && sender.user.as_str() == call_id
+    sender.server == Server::Call
+        && sender.device == 0
+        && sender.agent == 0
+        && sender.integrator == 0
+        && sender.user.as_str() == call_id
 }
 
 #[cfg(feature = "voip-control")]
 fn routed_call_sender(call: &IncomingCall) -> Jid {
     call.participant.as_ref().unwrap_or(&call.from).clone()
+}
+
+/// Reads existing trusted PN/LID identity mappings; a call stanza never teaches this lookup.
+/// Unknown or ambiguous aliases cannot authorize an answer to the current direct call.
+#[cfg(feature = "voip-control")]
+async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid) -> Option<Jid> {
+    let canonical = if observed.server == expected.server {
+        observed.clone()
+    } else {
+        client.swap_pn_lid_namespace(observed).await?
+    };
+    (canonical.to_non_ad() == expected.to_non_ad()).then_some(canonical)
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
@@ -1716,6 +1873,265 @@ mod tests {
     }
 
     #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_identity_uses_only_trusted_namespace_aliases() {
+        let client = make_sending_client().await;
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("12025550112", Server::Pn).with_device(4);
+        assert!(canonical_call_identity(&client, &pn, &lid).await.is_none());
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &pn.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical_call_identity(&client, &pn, &lid).await,
+            Some(lid.with_device(4))
+        );
+        assert!(
+            canonical_call_identity(&client, &pn, &fake_caller_lid())
+                .await
+                .is_none()
+        );
+        assert!(
+            canonical_call_identity(&client, &Jid::new("GROUP", Server::Call), &lid)
+                .await
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_rejects_forged_sender_and_creator_before_rekey() {
+        let client = make_sending_client().await;
+        let (_, generation) = register_native_opus_call(&client, Vec::new());
+        let rx = client
+            .call_registry()
+            .resident_session("CALL-ID-0001", generation)
+            .unwrap()
+            .take_rekey_receiver()
+            .unwrap();
+        let outsider = Jid::new("222222222222222", Server::Lid);
+        for (sender, creator) in [
+            (outsider.clone(), fake_caller_lid()),
+            (fake_caller_lid(), outsider),
+        ] {
+            let accept = NodeBuilder::new("call")
+                .attr("from", sender)
+                .attr("id", "FORGED-ACCEPT")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("accept")
+                    .attr("call-creator", creator)
+                    .attr("call-id", "CALL-ID-0001")
+                    .build()])
+                .build();
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                    .await
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(
+                client
+                    .call_registry()
+                    .answering_device_if_current("CALL-ID-0001", generation)
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_accept_participant_requires_its_own_call_service_envelope() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let (_, generation) = register_native_opus_call(&client, Vec::new());
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let rekey = client
+            .call_registry()
+            .resident_session("CALL-ID-0001", generation)
+            .unwrap()
+            .take_rekey_receiver()
+            .unwrap();
+        for sender in [
+            Jid::new("222222222222222", Server::Lid),
+            fake_caller_lid(),
+            Jid::new("OTHER-CALL", Server::Call),
+            Jid::new("CALL-ID-0001", Server::Lid),
+        ] {
+            let accept = NodeBuilder::new("call")
+                .attr("from", sender)
+                .attr("participant", fake_caller_lid().with_device(4))
+                .attr("id", "FORGED-ROUTED-ACCEPT")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("accept")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("call-id", "CALL-ID-0001")
+                    .build()])
+                .build();
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                    .await
+            );
+            assert!(rekey.try_recv().is_err());
+            assert!(events.try_recv().is_err());
+            assert!(
+                client
+                    .call_registry()
+                    .answering_device_if_current("CALL-ID-0001", generation)
+                    .is_none()
+            );
+        }
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn unmanaged_accept_preserves_signaling_observation_without_owned_effects() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("16000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(matches!(
+            events.try_recv().as_deref(),
+            Ok(Event::IncomingCall(call))
+                if matches!(call.action, CallAction::Accept { .. })
+                    && call.from == fake_caller_lid()
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(client.call_registry().active_count(), 0);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!cancelled, "the router still owns the generic ACK");
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn capabilityless_accept_preserves_the_trusted_pn_devices_preaccept_codec() {
+        for mapping_before_preaccept in [true, false] {
+            for accept_as_pn in [true, false] {
+                for answering_device in [4, 5] {
+                    let client = make_sending_client().await;
+                    let peer = Jid::new("222222222222222", Server::Lid);
+                    let pn = Jid::new("12025550112", Server::Pn);
+                    let creator = fake_caller_lid();
+                    let registry = client.call_registry();
+                    let mut session = wacore::voip_control::CallSession::new_outgoing(
+                        "ALIAS-CODEC",
+                        peer.clone(),
+                        creator.clone(),
+                    );
+                    session.audio_format =
+                        Some(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS);
+                    let generation = registry.insert(session);
+                    let rekey = registry
+                        .resident_session("ALIAS-CODEC", generation)
+                        .unwrap()
+                        .take_rekey_receiver()
+                        .unwrap();
+                    if mapping_before_preaccept {
+                        client
+                            .add_lid_pn_mapping(
+                                &peer.user,
+                                &pn.user,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let signaling = |tag: &'static str, sender: Jid, capability: bool| {
+                        let mut children = vec![
+                            NodeBuilder::new("audio")
+                                .attr("enc", "opus")
+                                .attr("rate", "16000")
+                                .build(),
+                        ];
+                        if capability {
+                            children.push(
+                                NodeBuilder::new("capability")
+                                    .attr("ver", "1")
+                                    .bytes(
+                                        wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER
+                                            .to_vec(),
+                                    )
+                                    .build(),
+                            );
+                        }
+                        NodeBuilder::new("call")
+                            .attr("from", sender)
+                            .attr("id", format!("ALIAS-{tag}"))
+                            .attr("t", "1766847151")
+                            .children([NodeBuilder::new(tag)
+                                .attr("call-id", "ALIAS-CODEC")
+                                .attr("call-creator", creator.clone())
+                                .children(children)
+                                .build()])
+                            .build()
+                    };
+                    let mut cancelled = false;
+                    assert!(
+                        CallHandler
+                            .handle(
+                                client.clone(),
+                                node_to_owned_ref(&signaling("preaccept", pn.with_device(4), true)),
+                                &mut cancelled,
+                            )
+                            .await
+                    );
+                    if !mapping_before_preaccept {
+                        client
+                            .add_lid_pn_mapping(
+                                &peer.user,
+                                &pn.user,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let answering =
+                        if accept_as_pn { &pn } else { &peer }.with_device(answering_device);
+                    assert!(
+                        CallHandler
+                            .handle(
+                                client.clone(),
+                                node_to_owned_ref(&signaling("accept", answering, false)),
+                                &mut cancelled,
+                            )
+                            .await
+                    );
+                    let answer = rekey
+                        .try_recv()
+                        .expect("authenticated answer reaches media");
+                    assert_eq!(
+                        answer.answering_lid,
+                        peer.with_device(answering_device).to_string()
+                    );
+                    assert_eq!(
+                        answer.audio_codec,
+                        (answering_device == 4)
+                            .then_some(wacore::voip_control::MediaAudioCodec::Opus),
+                        "a trusted alias keeps its own codec statement, never a sibling's"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "voip-control")]
     #[test]
     fn call_service_sender_is_the_exact_call_address() {
         let call_id = "GROUP-CALL";
@@ -1735,6 +2151,20 @@ mod tests {
             &Jid::new(call_id, Server::Call).with_device(2),
             call_id
         ));
+        // These in-memory fields are not retained by JID_PAIR marshaling on @call, so exercise
+        // the exact-address predicate directly rather than normalizing a forged fixture away.
+        for sender in [
+            Jid {
+                agent: 1,
+                ..Jid::new(call_id, Server::Call)
+            },
+            Jid {
+                integrator: 1,
+                ..Jid::new(call_id, Server::Call)
+            },
+        ] {
+            assert!(!is_call_service_sender(&sender, call_id));
+        }
     }
 
     #[cfg(feature = "voip-control")]

@@ -105,7 +105,7 @@ pub use opus_packet::{OpusBandwidth, OpusMode, OpusPacketShape, opus_packet_shap
 pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
 pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
-    VideoPipelineParams,
+    VideoPipelineParams, VideoReassemblyStats,
 };
 pub use tap::{InMemoryTap, PacketDir, PacketTap, TappedFactory, TappedTransport};
 pub use transport::{

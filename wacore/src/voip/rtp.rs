@@ -337,6 +337,26 @@ pub fn split_whatsapp_audio_piggyback(packet: &[u8], payload: &mut Vec<u8>) -> O
     Some(audio)
 }
 
+/// Authenticated payload bytes, excluding RTP padding. In a WhatsApp carrier the padding
+/// terminates the media part, before the embedded audio RTP packet.
+pub(crate) fn received_payload_len(packet: &[u8], payload: &[u8]) -> usize {
+    let media_end = parse_whatsapp_audio_piggyback_offset(packet)
+        .filter(|&offset| offset > 0 && offset < payload.len())
+        .unwrap_or(payload.len());
+    let padding = if packet.first().is_some_and(|byte| byte & 0x20 != 0) {
+        payload
+            .get(..media_end)
+            .and_then(|media| media.last())
+            .copied()
+            .map(usize::from)
+            .filter(|&padding| padding <= media_end)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    payload.len() - padding
+}
+
 /// The payload of a plain (unprotected) RTP packet: after the fixed header, CSRCs and extension
 /// block, and without RTP padding. `None` for a packet with no payload left.
 pub fn plain_rtp_payload(packet: &[u8]) -> Option<&[u8]> {
@@ -1104,6 +1124,21 @@ mod tests {
             assert_eq!(split_whatsapp_audio_piggyback(&header, &mut payload), None);
             assert_eq!(payload.len(), media.len() + audio.len());
         }
+    }
+
+    #[test]
+    fn received_payload_count_excludes_padding_before_embedded_audio() {
+        let header = video_header_with_piggyback(7, true);
+        let mut payload = vec![0x41, 1, 2, 3, 0, 0, 3];
+        let audio = [
+            0x80, 0xfa, 0, 9, 0, 0, 0x21, 0xc0, 0x12, 0x34, 0x56, 0x78, 0x50,
+        ];
+        payload.extend_from_slice(&audio);
+        assert_eq!(received_payload_len(&header, &payload), 4 + audio.len());
+        assert_eq!(received_payload_len(&[0xa0], &[1, 2, 0, 2]), 2);
+        assert_eq!(received_payload_len(&[0x80], &[1, 2, 0, 2]), 4);
+        assert_eq!(received_payload_len(&[0xa0], &[]), 0);
+        assert_eq!(received_payload_len(&[0xa0], &[9]), 1);
     }
 
     #[test]

@@ -575,6 +575,62 @@ pub struct MediaStats {
     /// and transport failures can still prevent delivery.
     #[builder(default)]
     pub video_retransmitted: u32,
+    /// Access units the peer's video reassembled into and handed on, before the application's sink.
+    ///
+    /// The baseline every other reassembly counter below is read against: packets that arrived
+    /// whole can still fail to become a picture, and these say which way.
+    #[builder(default)]
+    pub video_access_units_completed: u32,
+    /// Of those, access units closed by the next RTP timestamp because their marker packet never
+    /// came. Handed on, but likely missing their tail.
+    #[builder(default)]
+    pub video_access_units_without_marker: u32,
+    /// RTP timestamps whose packets left no complete NAL when the next timestamp began: pictures
+    /// that produced nothing to hand on.
+    #[builder(default)]
+    pub video_access_units_empty: u32,
+    /// Completed access units dropped because the depacketizer's ready queue was full.
+    #[builder(default)]
+    pub video_access_units_evicted: u32,
+    /// Authenticated video packets discarded for a timestamp older than the access unit being
+    /// assembled, or than the one last completed. Arrived, but too late to join their picture.
+    #[builder(default)]
+    pub video_rtp_stale_timestamp: u32,
+    /// Authenticated video packets discarded because they carry the timestamp of the access unit
+    /// whose marker already completed it.
+    #[builder(default)]
+    pub video_rtp_completed_timestamp: u32,
+    /// Partially reassembled FU-A NALs dropped because a fragment's sequence number skipped.
+    #[builder(default)]
+    pub video_fu_dropped_sequence_gap: u32,
+    /// Partially reassembled FU-A NALs dropped because the next RTP timestamp began before their
+    /// end fragment arrived.
+    #[builder(default)]
+    pub video_fu_dropped_timestamp_boundary: u32,
+    /// Partially reassembled FU-A NALs dropped because another NAL, or their access unit's marker,
+    /// arrived before their end fragment.
+    #[builder(default)]
+    pub video_fu_dropped_unterminated: u32,
+    /// FU-A middle or end fragments ignored because no start fragment was on record.
+    #[builder(default)]
+    pub video_fu_orphan_fragments: u32,
+    /// NALs refused because they would grow a NAL or an access unit past the reassembly limit.
+    #[builder(default)]
+    pub video_nal_oversize_dropped: u32,
+    /// Video payloads with no usable NAL: empty, NAL type 0, a packetization mode the depacketizer
+    /// does not support, or a truncated FU-A or STAP-A.
+    #[builder(default)]
+    pub video_payload_unusable: u32,
+    /// Times reassembly moved from one peer video SSRC to another. The first stream is not one.
+    #[builder(default)]
+    pub video_ssrc_switches: u32,
+    /// Those switches that discarded a partial access unit the previous stream left behind.
+    #[builder(default)]
+    pub video_ssrc_switch_partial_dropped: u32,
+    /// Video packets from an SSRC the peer had switched away from, ignored for their picture
+    /// while the switch settles. Their piggybacked audio is still played.
+    #[builder(default)]
+    pub video_retired_ssrc_ignored: u32,
 }
 
 impl MediaStats {
