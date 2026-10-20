@@ -366,6 +366,12 @@ wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
 [lints]
 workspace = true
 
+# Explicit host policy; does not change the library's automatic presence default.
+[[example]]
+name = "manual_presence"
+test = true
+required-features = ["sqlite-storage", "tokio-runtime", "tokio-transport", "ureq-client", "signal"]
+
 # The demo client. Needs only the package default features, so a plain
 # `cargo build --example demo` works without `required-features`.
 [[example]]
