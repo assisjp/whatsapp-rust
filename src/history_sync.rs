@@ -58,23 +58,20 @@ impl wacore::runtime::Runtime for HistoryDownloadRuntime {
 }
 
 fn encode_history_sync_notification(
-    mut notification: DetachedHistorySyncNotification,
+    notification: DetachedHistorySyncNotification,
+    wire: Vec<Bytes>,
     tracker: crate::sync_task::HistorySyncTaskTracker,
 ) -> (
     DetachedHistorySyncNotification,
     Vec<u8>,
     crate::sync_task::HistorySyncTaskTracker,
 ) {
-    notification
-        .notification
-        .initial_hist_bootstrap_inline_payload = notification
-        .inline_payload
-        .as_ref()
-        .map(|bytes| bytes.to_vec());
-    let encoded = waproto::codec::history_sync_notification_to_vec(&notification.notification);
-    notification
-        .notification
-        .initial_hist_bootstrap_inline_payload = None;
+    // Generated models discard unknown fields. Retain the original wire,
+    // merging repeated singular submessages by concatenation, not re-encoding.
+    let mut encoded = Vec::with_capacity(wire.iter().map(Bytes::len).sum());
+    for fragment in wire {
+        encoded.extend_from_slice(&fragment);
+    }
     (notification, encoded, tracker)
 }
 
@@ -365,6 +362,7 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
         let mut tracker = self.begin_history_sync_task(0);
         tracker.set_processing_permits(permit, Some(replay_permit));
+        let retained_wire;
         let notification: DetachedHistorySyncNotification = if notification.len()
             >= INLINE_NOTIFICATION_ENCODING_THRESHOLD
         {
@@ -386,6 +384,8 @@ impl Client {
                 })
                 .await;
             }
+            let encoded = Bytes::from(encoded);
+            retained_wire = encoded.clone();
             let mut lease = tracker.blocking_lease();
             let (tx, rx) = futures::channel::oneshot::channel();
             let work = self.runtime.spawn_blocking(Box::new(move || {
@@ -402,13 +402,14 @@ impl Client {
             rx.await
                 .map_err(|_| anyhow::anyhow!("history notification decoder stopped"))??
         } else {
+            retained_wire = Bytes::copy_from_slice(notification);
             let notification = waproto::codec::history_sync_notification_decode(notification)?;
             let notification = DetachedHistorySyncNotification::from(notification);
             tracker.set_payload_bytes(notification.inline_payload.as_ref().map_or(0, Bytes::len));
             notification
         };
         let Some((notification, mut tracker)) = self
-            .capture_history_sync_notification(key, notification, tracker)
+            .capture_history_sync_notification(key, notification, vec![retained_wire], tracker)
             .await?
         else {
             return Ok(());
@@ -435,6 +436,7 @@ impl Client {
         if self.history_sync_durability_hook.get().is_none() || !info.source.is_from_me {
             return Ok(());
         }
+        let wire = wacore::messages::history_sync_notification_wire(&carrier)?;
         let (_, notification) = wacore::messages::decode_unpadded_detached_history_sync(carrier)?;
         if let Some(notification) = notification {
             let key = HistorySyncKey {
@@ -446,7 +448,7 @@ impl Client {
                 notification.inline_payload.as_ref().map_or(0, Bytes::len),
             );
             if let Some((notification, mut tracker)) = self
-                .capture_history_sync_notification(&key, notification, tracker)
+                .capture_history_sync_notification(&key, notification, wire, tracker)
                 .await?
             {
                 tracker.set_durable_key(key);
@@ -470,6 +472,7 @@ impl Client {
         self: &Arc<Self>,
         key: &HistorySyncKey,
         notification: DetachedHistorySyncNotification,
+        wire: Vec<Bytes>,
         mut tracker: crate::sync_task::HistorySyncTaskTracker,
     ) -> anyhow::Result<
         Option<(
@@ -501,13 +504,11 @@ impl Client {
             .history_sync_durability_hook
             .get()
             .ok_or_else(|| anyhow::anyhow!("history sync durability hook is not registered"))?;
-        // Large inline copies and protobuf encoding must not stall receive's
+        // Large wire copies must not stall receive's
         // executor. The tracker follows the blocking work even if its caller
         // is cancelled, then follows the hook and queued/running processing.
-        let (notification, encoded, tracker) = if notification
-            .inline_payload
-            .as_ref()
-            .is_some_and(|bytes| bytes.len() >= INLINE_NOTIFICATION_ENCODING_THRESHOLD)
+        let (notification, encoded, tracker) = if wire.iter().map(Bytes::len).sum::<usize>()
+            >= INLINE_NOTIFICATION_ENCODING_THRESHOLD
         {
             // Intake must not start a third large CPU job while replay and the
             // worker occupy both slots. Do not wait here under the receive
@@ -524,7 +525,11 @@ impl Client {
             let (tx, rx) = futures::channel::oneshot::channel();
             self.runtime
                 .spawn_blocking(Box::new(move || {
-                    let _ = tx.send(encode_history_sync_notification(notification, tracker));
+                    let _ = tx.send(encode_history_sync_notification(
+                        notification,
+                        wire,
+                        tracker,
+                    ));
                 }))
                 .await;
             let (notification, encoded, mut tracker) = rx
@@ -537,7 +542,7 @@ impl Client {
             }
             (notification, encoded, tracker)
         } else {
-            encode_history_sync_notification(notification, tracker)
+            encode_history_sync_notification(notification, wire, tracker)
         };
         let metadata = history_sync_metadata(&notification);
         hook.on_notification(key, &metadata, &encoded).await?;

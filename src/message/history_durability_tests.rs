@@ -2,6 +2,7 @@ use super::*;
 use crate::store::traits::Backend;
 use crate::types::message::{MessageInfo, MessageSource};
 use crate::{HistorySyncDurabilityHook, HistorySyncKey, HistorySyncMetadata};
+use bytes::Bytes;
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
 use std::sync::Mutex;
@@ -1267,4 +1268,81 @@ async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_unti
             .unwrap();
         drop((first, second, replay));
     }
+}
+
+#[tokio::test]
+async fn durable_history_replay_retains_unknown_notification_fields() {
+    let (client, hook, _) = memory_client().await;
+    hook.require_journal.store(false, Ordering::SeqCst);
+    let mut wire = waproto::codec::history_sync_notification_to_vec(&notification());
+    // Synthetic future field 1000, varint 123. Generated owned models drop it.
+    wire.extend_from_slice(&[0xc0, 0x3e, 0x7b]);
+    let decoded = waproto::codec::history_sync_notification_decode(&wire).unwrap();
+    assert_ne!(
+        waproto::codec::history_sync_notification_to_vec(&decoded),
+        wire
+    );
+    client
+        .replay_history_sync_notification(&key(&info("UNKNOWN_WIRE")), &wire)
+        .await
+        .unwrap();
+    assert_eq!(hook.records.lock().unwrap()[0].1, wire);
+}
+
+#[tokio::test]
+async fn durable_history_reconnect_keeps_parked_replay_accounted() {
+    let (client, hook, _) = memory_client().await;
+    hook.require_journal.store(false, Ordering::SeqCst);
+    hook.parked.store(true, Ordering::SeqCst);
+    let replay = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let wire = waproto::codec::history_sync_notification_to_vec(&notification());
+            client
+                .replay_history_sync_notification(&key(&info("RECONNECT_ACCOUNTING")), &wire)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook.entered.notified())
+        .await
+        .unwrap();
+    let before = client.history_sync_activity.snapshot();
+    assert_eq!(before.tasks, 1);
+    assert!(before.payload_bytes > 0);
+    client.cleanup_connection_state().await;
+    let after = client.history_sync_activity.snapshot();
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.payload_bytes, before.payload_bytes);
+    replay.abort();
+    assert!(replay.await.unwrap_err().is_cancelled());
+    history_idle(&client).await;
+    assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
+}
+
+#[tokio::test]
+async fn durable_history_intake_retains_unknown_notification_fields() {
+    fn nested(field: u32, body: &[u8]) -> Bytes {
+        let mut wire = Vec::new();
+        buffa::encoding::encode_varint(u64::from(field) << 3 | 2, &mut wire);
+        buffa::encoding::encode_varint(body.len() as u64, &mut wire);
+        wire.extend_from_slice(body);
+        Bytes::from(wire)
+    }
+    let (client, hook, _, receiver) =
+        client_with_receiver(Arc::new(wacore::store::in_memory::InMemoryBackend::new())).await;
+    hook.require_journal.store(false, Ordering::SeqCst);
+    let mut wire = waproto::codec::history_sync_notification_to_vec(&notification());
+    wire.extend_from_slice(&[0xc0, 0x3e, 0x7b]);
+    let protocol = nested(
+        waproto::tags::message::protocol_message::HISTORY_SYNC_NOTIFICATION,
+        &wire,
+    );
+    let carrier = nested(waproto::tags::message::PROTOCOL_MESSAGE, &protocol);
+    client
+        .commit_history_sync_carrier(&info("UNKNOWN_INTAKE"), carrier)
+        .await
+        .unwrap();
+    assert_eq!(hook.records.lock().unwrap()[0].1, wire);
+    drop(receiver.recv().await.unwrap());
+    history_idle(&client).await;
 }

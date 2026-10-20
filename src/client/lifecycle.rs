@@ -2383,7 +2383,11 @@ impl Client {
             Err(poison) => *poison.into_inner() = None,
         }
         drop(terminal_gate);
-        self.history_sync_activity.reset();
+        // Durable hooks and blocking leases can outlive this socket. Their
+        // trackers must remain in the accounting generation until they drop.
+        if self.history_sync_durability_hook.get().is_none() {
+            self.history_sync_activity.reset();
+        }
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
         // Scoped so the sync guard is dropped before the awaits below (a
