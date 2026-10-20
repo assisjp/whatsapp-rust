@@ -108,10 +108,38 @@ impl Checkpoint {
     }
 }
 
+#[derive(Clone)]
+struct CheckpointStore {
+    inner: Arc<tokio::sync::Mutex<Checkpoint>>,
+}
+impl CheckpointStore {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Checkpoint { directory })),
+        }
+    }
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Checkpoint) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        // Hold the owned async guard inside the blocking task. Cancellation of
+        // its caller cannot release admission while disk I/O is still running.
+        // Subsequent retries wait asynchronously without creating more workers.
+        let checkpoint = self.inner.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || operation(&checkpoint)).await?
+    }
+    async fn load(&self) -> Result<Option<u64>> {
+        self.run(Checkpoint::load).await
+    }
+    async fn save(&self, timestamp: u64) -> Result<()> {
+        self.run(move |checkpoint| checkpoint.save(timestamp)).await
+    }
+}
+
 struct Companion {
     client: Arc<Client>,
     epoch: Arc<Mutex<Epoch>>,
-    checkpoint: Arc<Mutex<Checkpoint>>,
+    checkpoint: CheckpointStore,
 }
 impl Host for Companion {
     fn generation(&self) -> Option<u64> {
@@ -131,23 +159,10 @@ impl Host for Companion {
         Ok(())
     }
     async fn load_success(&self) -> Result<Option<u64>> {
-        let checkpoint = self.checkpoint.clone();
-        tokio::task::spawn_blocking(move || {
-            checkpoint.lock().unwrap_or_else(|p| p.into_inner()).load()
-        })
-        .await?
+        self.checkpoint.load().await
     }
     async fn save_success(&self, timestamp: u64) -> Result<()> {
-        let checkpoint = self.checkpoint.clone();
-        // A timed-out spawn_blocking write may still finish. Serialize retries
-        // through the same lock instead of racing on the staging file.
-        tokio::task::spawn_blocking(move || {
-            checkpoint
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .save(timestamp)
-        })
-        .await?
+        self.checkpoint.save(timestamp).await
     }
     fn notice(&self, notice: Notice) {
         match notice {
@@ -217,7 +232,7 @@ async fn main() -> Result<()> {
     let host = Companion {
         client: client.clone(),
         epoch,
-        checkpoint: Arc::new(Mutex::new(Checkpoint { directory })),
+        checkpoint: CheckpointStore::new(directory),
     };
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut handle = bot.spawn();
@@ -257,6 +272,55 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_storage_caller_cannot_accumulate_blocking_retries() {
+        use portable_atomic::{AtomicUsize, Ordering};
+        let directory = std::env::temp_dir().join(format!("presence-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let store = CheckpointStore::new(directory.clone());
+        let first = store.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            first
+                .run(move |_| {
+                    let _ = started_tx.send(());
+                    release_rx.recv()?;
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let retries_started = Arc::new(AtomicUsize::new(0));
+        for _ in 0..4 {
+            let count = retries_started.clone();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    store.run(move |_| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                )
+                .await
+                .is_err()
+            );
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), store.load())
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        assert_eq!(retries_started.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn restart_reads_only_a_completed_checkpoint_and_rejects_corruption() {
         let directory =
