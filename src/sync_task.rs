@@ -54,11 +54,13 @@ impl HistorySyncActivity {
         state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
         drop(state);
         HistorySyncTaskTracker {
-            activity: Arc::clone(self),
-            generation,
-            payload_bytes,
-            durable_key: None,
-            processing_permits: None,
+            inner: Box::new(HistorySyncTaskTrackerInner {
+                activity: Arc::clone(self),
+                generation,
+                payload_bytes,
+                durable_key: None,
+                processing_permits: None,
+            }),
         }
     }
 
@@ -117,6 +119,13 @@ impl HistorySyncActivity {
 
 #[doc(hidden)]
 pub struct HistorySyncTaskTracker {
+    // The bounded channel allocates every slot when the Client is built.
+    // Keep recovery state out of those empty slots, without changing the
+    // public MajorSyncTask variant or its tracker field type.
+    inner: Box<HistorySyncTaskTrackerInner>,
+}
+
+struct HistorySyncTaskTrackerInner {
     activity: Arc<HistorySyncActivity>,
     generation: HistorySyncGeneration,
     payload_bytes: usize,
@@ -140,59 +149,65 @@ impl HistorySyncTaskTracker {
         processing: async_lock::SemaphoreGuardArc,
         replay: Option<async_lock::SemaphoreGuardArc>,
     ) {
-        self.processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
+        self.inner.processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
             _processing: processing,
             _replay: replay,
         }));
     }
 
     pub(crate) fn processing_permits(&self) -> Option<Arc<HistorySyncProcessingPermits>> {
-        self.processing_permits.clone()
+        self.inner.processing_permits.clone()
+    }
+
+    pub(crate) fn clear_processing_permits(&mut self) {
+        self.inner.processing_permits = None;
     }
 
     pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
-        self.durable_key = Some(Box::new(key));
+        self.inner.durable_key = Some(Box::new(key));
     }
 
     pub(crate) fn take_durable_key(&mut self) -> Option<Box<crate::HistorySyncKey>> {
-        self.durable_key.take()
+        self.inner.durable_key.take()
     }
 
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {
-        let mut state = self.activity.state_guard();
-        if state.generation != self.generation {
-            self.payload_bytes = payload_bytes;
+        let mut state = self.inner.activity.state_guard();
+        if state.generation != self.inner.generation {
+            self.inner.payload_bytes = payload_bytes;
             return;
         }
-        match payload_bytes.cmp(&self.payload_bytes) {
+        match payload_bytes.cmp(&self.inner.payload_bytes) {
             std::cmp::Ordering::Greater => {
-                let additional = payload_bytes - self.payload_bytes;
+                let additional = payload_bytes - self.inner.payload_bytes;
                 state.payload_bytes = state.payload_bytes.saturating_add(additional);
                 state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
             }
             std::cmp::Ordering::Less => {
-                let released = self.payload_bytes - payload_bytes;
+                let released = self.inner.payload_bytes - payload_bytes;
                 state.payload_bytes = state.payload_bytes.saturating_sub(released);
             }
             std::cmp::Ordering::Equal => {}
         }
-        self.payload_bytes = payload_bytes;
+        self.inner.payload_bytes = payload_bytes;
     }
 }
 
 impl std::fmt::Debug for HistorySyncTaskTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistorySyncTaskTracker")
-            .field("generation", &self.generation)
-            .field("payload_bytes", &self.payload_bytes)
+            .field("generation", &self.inner.generation)
+            .field("payload_bytes", &self.inner.payload_bytes)
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for HistorySyncTaskTracker {
     fn drop(&mut self) {
-        drop(self.processing_permits.take());
-        self.activity.release(self.generation, self.payload_bytes);
+        drop(self.inner.processing_permits.take());
+        self.inner
+            .activity
+            .release(self.inner.generation, self.inner.payload_bytes);
     }
 }
 

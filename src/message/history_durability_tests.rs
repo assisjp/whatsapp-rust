@@ -829,6 +829,23 @@ impl wacore::runtime::Runtime for ParkedEncodingRuntime {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn durable_history_large_intake_does_not_encode_outside_processing_capacity() {
+    let (client, hook, transport) = memory_client().await;
+    let first = client.acquire_history_sync_permit().await.unwrap();
+    let second = client.acquire_history_sync_permit().await.unwrap();
+    let info = info("SATURATED_ENCODING");
+    let mut notification = notification();
+    notification.initial_hist_bootstrap_inline_payload = Some(vec![0xa5; 1024 * 1024]);
+
+    assert!(!receive(&client, &info, notification).await);
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
+    assert!(transport.sent().is_empty());
+    assert!(pending(&client, &info).await.is_some());
+    assert_eq!(client.history_sync_activity.tasks(), 0);
+    drop((first, second));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked_on_cancel() {
     for cancel in [false, true] {
         let (release, gate) = std::sync::mpsc::channel();
@@ -866,12 +883,34 @@ async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked
         );
         assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
         assert!(transport.sent().is_empty());
+        let spare = client.acquire_history_sync_permit().await.unwrap();
+        assert!(
+            client
+                .history_sync_activity
+                .processing_permits
+                .try_acquire_arc()
+                .is_none()
+        );
         if cancel {
             operation.abort();
             assert!(operation.await.unwrap_err().is_cancelled());
             assert_eq!(client.history_sync_activity.tasks(), 1);
+            assert!(
+                client
+                    .history_sync_activity
+                    .processing_permits
+                    .try_acquire_arc()
+                    .is_none()
+            );
             release.send(()).unwrap();
             history_idle(&client).await;
+            assert!(
+                client
+                    .history_sync_activity
+                    .processing_permits
+                    .try_acquire_arc()
+                    .is_some()
+            );
             assert!(pending(&client, &info).await.is_some());
             assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
         } else {
@@ -890,6 +929,7 @@ async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked
             drop(receiver.recv().await.unwrap());
             history_idle(&client).await;
         }
+        drop(spare);
     }
 }
 

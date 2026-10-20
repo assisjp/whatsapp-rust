@@ -391,7 +391,7 @@ impl Client {
         self: &Arc<Self>,
         key: &HistorySyncKey,
         notification: DetachedHistorySyncNotification,
-        tracker: crate::sync_task::HistorySyncTaskTracker,
+        mut tracker: crate::sync_task::HistorySyncTaskTracker,
     ) -> anyhow::Result<
         Option<(
             DetachedHistorySyncNotification,
@@ -430,14 +430,33 @@ impl Client {
             .as_ref()
             .is_some_and(|bytes| bytes.len() >= INLINE_NOTIFICATION_ENCODING_THRESHOLD)
         {
+            // Intake must not start a third large CPU job while replay and the
+            // worker occupy both slots. Do not wait here under the receive
+            // commit permit: a failed admission leaves the carrier journaled.
+            let encoding_permit = tracker.processing_permits().is_none();
+            if encoding_permit {
+                let permit = self
+                    .history_sync_activity
+                    .processing_permits
+                    .try_acquire_arc()
+                    .ok_or_else(|| anyhow::anyhow!("history sync processing capacity is full"))?;
+                tracker.set_processing_permits(permit, None);
+            }
             let (tx, rx) = futures::channel::oneshot::channel();
             self.runtime
                 .spawn_blocking(Box::new(move || {
                     let _ = tx.send(encode_history_sync_notification(notification, tracker));
                 }))
                 .await;
-            rx.await
-                .map_err(|_| anyhow::anyhow!("history notification encoding did not complete"))?
+            let (notification, encoded, mut tracker) = rx
+                .await
+                .map_err(|_| anyhow::anyhow!("history notification encoding did not complete"))?;
+            // Only intake borrows a slot for encoding. Release it before the
+            // hook/queue; the worker acquires its own slot when it dequeues.
+            if encoding_permit {
+                tracker.clear_processing_permits();
+            }
+            (notification, encoded, tracker)
         } else {
             encode_history_sync_notification(notification, tracker)
         };
