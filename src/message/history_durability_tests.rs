@@ -693,6 +693,49 @@ async fn durable_history_worker_and_replay_share_two_permits_and_cancellation_re
 }
 
 #[tokio::test]
+async fn durable_history_session_wake_preserves_semaphore_waiter_registration() {
+    use std::future::Future as _;
+    use std::task::{Context, Wake, Waker};
+
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (client, _, _) = memory_client().await;
+    let held = client.acquire_history_sync_permit().await.unwrap();
+    let other = client.acquire_history_sync_permit().await.unwrap();
+    let first_wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+    let second_wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+    let first_waker = Waker::from(first_wakes.clone());
+    let second_waker = Waker::from(second_wakes.clone());
+    let mut first_cx = Context::from_waker(&first_waker);
+    let mut second_cx = Context::from_waker(&second_waker);
+    let mut first = Box::pin(client.acquire_history_sync_permit());
+    let mut second = Box::pin(client.acquire_history_sync_permit());
+    assert!(first.as_mut().poll(&mut first_cx).is_pending());
+    assert!(second.as_mut().poll(&mut second_cx).is_pending());
+
+    client.session_state_notifier.notify(usize::MAX);
+    // A later waiter can be scheduled first after the shared session wake.
+    assert!(second.as_mut().poll(&mut second_cx).is_pending());
+    assert!(first.as_mut().poll(&mut first_cx).is_pending());
+    first_wakes.0.store(0, Ordering::SeqCst);
+    second_wakes.0.store(0, Ordering::SeqCst);
+    drop(held);
+    let first_notified = first_wakes.0.load(Ordering::SeqCst);
+    let second_notified = second_wakes.0.load(Ordering::SeqCst);
+    drop((first, second, other));
+    assert!(
+        first_notified > 0,
+        "older semaphore waiter lost its listener on session wake"
+    );
+    assert_eq!(second_notified, 0);
+}
+
+#[tokio::test]
 async fn durable_history_two_replays_leave_capacity_for_normal_sync_intake() {
     let (client, hook, _) = memory_client().await;
     hook.require_journal.store(false, Ordering::SeqCst);

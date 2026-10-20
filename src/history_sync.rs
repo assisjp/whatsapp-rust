@@ -560,6 +560,8 @@ impl Client {
         semaphore: &Arc<async_lock::Semaphore>,
     ) -> Option<async_lock::SemaphoreGuardArc> {
         use futures::FutureExt as _;
+        // Session wakeups must not discard the semaphore listener.
+        let mut acquire = std::pin::pin!(semaphore.acquire_arc().fuse());
         loop {
             let state_changed = self.session_state_notifier.listen();
             if self.is_permanently_stopped() {
@@ -567,7 +569,7 @@ impl Client {
             }
             futures::select_biased! {
                 _ = state_changed.fuse() => {},
-                permit = semaphore.acquire_arc().fuse() => {
+                permit = acquire => {
                     return (!self.is_permanently_stopped()).then_some(permit);
                 },
             }
