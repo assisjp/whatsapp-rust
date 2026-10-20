@@ -181,6 +181,24 @@ async fn client_with_runtime(
     Arc<crate::transport::mock::CapturingMockTransport>,
     async_channel::Receiver<crate::sync_task::MajorSyncTask>,
 ) {
+    client_with_http_and_runtime(
+        backend,
+        runtime,
+        Arc::new(crate::test_utils::MockHttpClient),
+    )
+    .await
+}
+
+async fn client_with_http_and_runtime(
+    backend: Arc<dyn Backend>,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+    http: Arc<dyn crate::http::HttpClient>,
+) -> (
+    Arc<Client>,
+    Arc<RecordingHistory>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+    async_channel::Receiver<crate::sync_task::MajorSyncTask>,
+) {
     let persistence = Arc::new(
         crate::store::persistence_manager::PersistenceManager::new(backend.clone())
             .await
@@ -190,7 +208,7 @@ async fn client_with_runtime(
         .with_runtime_arc(runtime)
         .with_persistence_manager(persistence)
         .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
-        .with_http_client(crate::test_utils::MockHttpClient)
+        .with_http_client_arc(http)
         .build()
         .await
         .unwrap()
@@ -783,7 +801,117 @@ async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_replay
 struct ParkedEncodingRuntime {
     entered: Arc<tokio::sync::Notify>,
     release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    skip_first: AtomicBool,
+    skip: AtomicUsize,
+}
+
+struct BufferedHistoryHttp(Vec<u8>);
+
+#[async_trait::async_trait]
+impl crate::http::HttpClient for BufferedHistoryHttp {
+    async fn execute(
+        &self,
+        request: crate::http::HttpRequest,
+    ) -> anyhow::Result<crate::http::HttpResponse> {
+        assert!(request.url.contains("cdn.example.invalid"));
+        Ok(crate::http::HttpResponse::new(200, self.0.clone()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_history_cancelled_download_keeps_cpu_and_replay_leases() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let runtime = Arc::new(ParkedEncodingRuntime {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Mutex::new(Some(gate)),
+        skip: AtomicUsize::new(0),
+    });
+    let mut notification = notification();
+    let compressed = notification
+        .initial_hist_bootstrap_inline_payload
+        .take()
+        .unwrap();
+    let encrypted =
+        wacore::upload::encrypt_media(&compressed, wacore::download::MediaType::History).unwrap();
+    notification.direct_path = Some("/synthetic-history".into());
+    notification.media_key = Some(encrypted.media_key.to_vec());
+    notification.file_sha256 = Some(encrypted.file_sha256.to_vec());
+    notification.file_enc_sha256 = Some(encrypted.file_enc_sha256.to_vec());
+    let (client, hook, transport, _) = client_with_http_and_runtime(
+        Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
+        runtime.clone(),
+        Arc::new(BufferedHistoryHttp(encrypted.data_to_upload)),
+    )
+    .await;
+    *client.media_conn.write().await = Some(crate::mediaconn::MediaConn {
+        auth: "synthetic-history-auth".into(),
+        ttl: 300,
+        auth_ttl: Some(300),
+        hosts: vec![crate::mediaconn::MediaConnHost::new(
+            "cdn.example.invalid".into(),
+        )],
+        fetched_at: wacore::time::Instant::now(),
+    });
+    hook.require_journal.store(false, Ordering::SeqCst);
+    let replay = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+            client
+                .replay_history_sync_notification(&key(&info("DOWNLOAD_CPU_CANCEL")), &bytes)
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.entered.notified(),
+    )
+    .await
+    .unwrap();
+    replay.abort();
+    assert!(replay.await.unwrap_err().is_cancelled());
+    let spare = client
+        .history_sync_activity
+        .processing_permits
+        .try_acquire_arc()
+        .unwrap();
+    let cpu_retained = client
+        .history_sync_activity
+        .processing_permits
+        .try_acquire_arc()
+        .is_none();
+    let replay_retained = client
+        .history_sync_activity
+        .replay_permits
+        .try_acquire_arc()
+        .is_none();
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if client
+                .history_sync_activity
+                .processing_permits
+                .try_acquire_arc()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.chunks.load(Ordering::SeqCst), 0);
+    assert!(transport.sent().is_empty());
+    assert!(
+        cpu_retained,
+        "download CPU released its processing lease before blocking work finished"
+    );
+    assert!(
+        replay_retained,
+        "download CPU released its replay reservation before blocking work finished"
+    );
+    drop(spare);
 }
 
 #[async_trait::async_trait]
@@ -807,7 +935,13 @@ impl wacore::runtime::Runtime for ParkedEncodingRuntime {
         &self,
         f: Box<dyn FnOnce() + Send + 'static>,
     ) -> wacore::runtime::BoxFuture<'static, ()> {
-        if self.skip_first.swap(false, Ordering::SeqCst) {
+        if self
+            .skip
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |skip| {
+                skip.checked_sub(1)
+            })
+            .is_ok()
+        {
             return crate::runtime_impl::TokioRuntime.spawn_blocking(f);
         }
         let release = self.release.lock().unwrap().take().unwrap();
@@ -852,7 +986,7 @@ async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked
         let runtime = Arc::new(ParkedEncodingRuntime {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Mutex::new(Some(gate)),
-            skip_first: AtomicBool::new(false),
+            skip: AtomicUsize::new(0),
         });
         let (client, hook, transport, receiver) = client_with_runtime(
             Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
@@ -934,62 +1068,69 @@ async fn durable_history_large_inline_encoding_leaves_executor_and_stays_tracked
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn durable_history_cancelled_replay_keeps_permit_until_blocking_encoding_finishes() {
-    let (release, gate) = std::sync::mpsc::channel();
-    let runtime = Arc::new(ParkedEncodingRuntime {
-        entered: Arc::new(tokio::sync::Notify::new()),
-        release: Mutex::new(Some(gate)),
-        skip_first: AtomicBool::new(false),
-    });
-    let (client, hook, _, _) = client_with_runtime(
-        Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
-        runtime.clone(),
-    )
-    .await;
-    hook.require_journal.store(false, Ordering::SeqCst);
-    let mut notification = notification();
-    notification.initial_hist_bootstrap_inline_payload = Some(vec![0xa5; 1024 * 1024]);
-    let replay = tokio::spawn({
-        let client = client.clone();
-        async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
-            client
-                .replay_history_sync_notification(&key(&info("CANCEL_ENCODING")), &bytes)
-                .await
-        }
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        runtime.entered.notified(),
-    )
-    .await
-    .unwrap();
-    replay.abort();
-    assert!(replay.await.unwrap_err().is_cancelled());
-    let spare = client
-        .history_sync_activity
-        .processing_permits
-        .try_acquire_arc()
+async fn durable_history_cancelled_replay_keeps_permit_until_blocking_decode_or_encoding_finishes()
+{
+    for skipped in [0, 1] {
+        let (release, gate) = std::sync::mpsc::channel();
+        let runtime = Arc::new(ParkedEncodingRuntime {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Mutex::new(Some(gate)),
+            skip: AtomicUsize::new(skipped),
+        });
+        let (client, hook, _, _) = client_with_runtime(
+            Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
+            runtime.clone(),
+        )
+        .await;
+        hook.require_journal.store(false, Ordering::SeqCst);
+        let mut notification = notification();
+        notification.initial_hist_bootstrap_inline_payload = Some(vec![0xa5; 1024 * 1024]);
+        let replay = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+                client
+                    .replay_history_sync_notification(&key(&info("CANCEL_ENCODING")), &bytes)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.entered.notified(),
+        )
+        .await
         .unwrap();
-    assert!(
-        client
+        assert_eq!(
+            client.history_sync_activity.snapshot().payload_bytes,
+            if skipped == 0 { 0 } else { 1024 * 1024 }
+        );
+        replay.abort();
+        assert!(replay.await.unwrap_err().is_cancelled());
+        let spare = client
             .history_sync_activity
             .processing_permits
             .try_acquire_arc()
-            .is_none()
-    );
-    assert_eq!(client.history_sync_activity.tasks(), 1);
-    release.send(()).unwrap();
-    history_idle(&client).await;
-    assert!(
-        client
-            .history_sync_activity
-            .processing_permits
-            .try_acquire_arc()
-            .is_some()
-    );
-    assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
-    drop(spare);
+            .unwrap();
+        assert!(
+            client
+                .history_sync_activity
+                .processing_permits
+                .try_acquire_arc()
+                .is_none()
+        );
+        assert_eq!(client.history_sync_activity.tasks(), 1);
+        release.send(()).unwrap();
+        history_idle(&client).await;
+        assert!(
+            client
+                .history_sync_activity
+                .processing_permits
+                .try_acquire_arc()
+                .is_some()
+        );
+        assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
+        drop(spare);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -999,7 +1140,7 @@ async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_unti
         let runtime = Arc::new(ParkedEncodingRuntime {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Mutex::new(Some(gate)),
-            skip_first: AtomicBool::new(parsing),
+            skip: AtomicUsize::new(1 + usize::from(parsing)),
         });
         let (client, hook, _, receiver) = client_with_runtime(
             Arc::new(wacore::store::in_memory::InMemoryBackend::new()),
@@ -1028,6 +1169,14 @@ async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_unti
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
+        assert_eq!(client.history_sync_activity.tasks(), 1);
+        assert_eq!(
+            client.history_sync_activity.snapshot().payload_bytes,
+            1024 * 1024
+        );
+        client.offline_sync_completed.store(true, Ordering::Relaxed);
+        let mut startup = Box::pin(client.wait_for_startup_sync(std::time::Duration::from_secs(5)));
+        assert!(futures::poll!(startup.as_mut()).is_pending());
         let before = hook.notifications.load(Ordering::SeqCst);
         assert_eq!(before, usize::from(parsing));
         let bytes = waproto::codec::history_sync_notification_to_vec(&notification());

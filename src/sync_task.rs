@@ -54,12 +54,14 @@ impl HistorySyncActivity {
         state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
         drop(state);
         HistorySyncTaskTracker {
-            inner: Box::new(HistorySyncTaskTrackerInner {
+            inner: Arc::new(HistorySyncTaskTrackerInner {
                 activity: Arc::clone(self),
                 generation,
-                payload_bytes,
-                durable_key: None,
-                processing_permits: None,
+                state: Mutex::new(HistorySyncTaskState {
+                    payload_bytes,
+                    durable_key: None,
+                    processing_permits: None,
+                }),
             }),
         }
     }
@@ -122,12 +124,16 @@ pub struct HistorySyncTaskTracker {
     // The bounded channel allocates every slot when the Client is built.
     // Keep recovery state out of those empty slots, without changing the
     // public MajorSyncTask variant or its tracker field type.
-    inner: Box<HistorySyncTaskTrackerInner>,
+    inner: Arc<HistorySyncTaskTrackerInner>,
 }
 
 struct HistorySyncTaskTrackerInner {
     activity: Arc<HistorySyncActivity>,
     generation: HistorySyncGeneration,
+    state: Mutex<HistorySyncTaskState>,
+}
+
+struct HistorySyncTaskState {
     payload_bytes: usize,
     // Recovery context follows this one task through the existing public queue
     // shape. It must not be keyed globally by the non-unique stanza ID.
@@ -144,52 +150,58 @@ pub(crate) struct HistorySyncProcessingPermits {
 }
 
 impl HistorySyncTaskTracker {
+    /// Retain this task's activity and capacity until physical CPU work ends.
+    pub(crate) fn blocking_lease(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, HistorySyncTaskState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn set_processing_permits(
         &mut self,
         processing: async_lock::SemaphoreGuardArc,
         replay: Option<async_lock::SemaphoreGuardArc>,
     ) {
-        self.inner.processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
+        self.state().processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
             _processing: processing,
             _replay: replay,
         }));
     }
 
     pub(crate) fn processing_permits(&self) -> Option<Arc<HistorySyncProcessingPermits>> {
-        self.inner.processing_permits.clone()
+        self.state().processing_permits.clone()
     }
 
     pub(crate) fn clear_processing_permits(&mut self) {
-        self.inner.processing_permits = None;
+        self.state().processing_permits = None;
     }
 
     pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
-        self.inner.durable_key = Some(Box::new(key));
+        self.state().durable_key = Some(Box::new(key));
     }
 
     pub(crate) fn take_durable_key(&mut self) -> Option<Box<crate::HistorySyncKey>> {
-        self.inner.durable_key.take()
+        self.state().durable_key.take()
     }
 
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {
+        let mut task = self.state();
         let mut state = self.inner.activity.state_guard();
-        if state.generation != self.inner.generation {
-            self.inner.payload_bytes = payload_bytes;
-            return;
+        if state.generation == self.inner.generation {
+            state.payload_bytes = state
+                .payload_bytes
+                .saturating_sub(task.payload_bytes)
+                .saturating_add(payload_bytes);
+            state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
         }
-        match payload_bytes.cmp(&self.inner.payload_bytes) {
-            std::cmp::Ordering::Greater => {
-                let additional = payload_bytes - self.inner.payload_bytes;
-                state.payload_bytes = state.payload_bytes.saturating_add(additional);
-                state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
-            }
-            std::cmp::Ordering::Less => {
-                let released = self.inner.payload_bytes - payload_bytes;
-                state.payload_bytes = state.payload_bytes.saturating_sub(released);
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-        self.inner.payload_bytes = payload_bytes;
+        task.payload_bytes = payload_bytes;
     }
 }
 
@@ -197,17 +209,19 @@ impl std::fmt::Debug for HistorySyncTaskTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistorySyncTaskTracker")
             .field("generation", &self.inner.generation)
-            .field("payload_bytes", &self.inner.payload_bytes)
+            .field("payload_bytes", &self.state().payload_bytes)
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for HistorySyncTaskTracker {
+impl Drop for HistorySyncTaskTrackerInner {
     fn drop(&mut self) {
-        drop(self.inner.processing_permits.take());
-        self.inner
-            .activity
-            .release(self.inner.generation, self.inner.payload_bytes);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(state.processing_permits.take());
+        self.activity.release(self.generation, state.payload_bytes);
     }
 }
 

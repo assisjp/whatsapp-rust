@@ -17,6 +17,46 @@ use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetad
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 const INLINE_NOTIFICATION_ENCODING_THRESHOLD: usize = 256 * 1024;
 
+// Download cancellation stops I/O, but queued/running crypto cannot be
+// interrupted. Keep history accounting alive in those physical CPU jobs.
+struct HistoryDownloadRuntime {
+    inner: Arc<dyn wacore::runtime::Runtime>,
+    tracker: crate::sync_task::HistorySyncTaskTracker,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type HistoryBlockingJob = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(target_arch = "wasm32")]
+type HistoryBlockingJob = Box<dyn FnOnce() + 'static>;
+
+impl wacore::runtime::Runtime for HistoryDownloadRuntime {
+    fn spawn(
+        &self,
+        future: wacore::runtime::BoxFuture<'static, ()>,
+    ) -> wacore::runtime::AbortHandle {
+        self.inner.spawn(future)
+    }
+    fn spawn_detached(&self, future: wacore::runtime::BoxFuture<'static, ()>) {
+        self.inner.spawn_detached(future);
+    }
+    fn sleep(&self, duration: std::time::Duration) -> wacore::runtime::BoxFuture<'static, ()> {
+        self.inner.sleep(duration)
+    }
+    fn spawn_blocking(&self, job: HistoryBlockingJob) -> wacore::runtime::BoxFuture<'static, ()> {
+        let lease = self.tracker.blocking_lease();
+        self.inner.spawn_blocking(Box::new(move || {
+            let _lease = lease;
+            job();
+        }))
+    }
+    fn yield_now(&self) -> Option<wacore::runtime::BoxFuture<'static, ()>> {
+        self.inner.yield_now()
+    }
+    fn yield_frequency(&self) -> u32 {
+        self.inner.yield_frequency()
+    }
+}
+
 fn encode_history_sync_notification(
     mut notification: DetachedHistorySyncNotification,
     tracker: crate::sync_task::HistorySyncTaskTracker,
@@ -323,11 +363,50 @@ impl Client {
             .acquire_history_sync_permit()
             .await
             .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
-        let notification = waproto::codec::history_sync_notification_decode(notification)?;
-        let notification: DetachedHistorySyncNotification = notification.into();
-        let mut tracker = self
-            .begin_history_sync_task(notification.inline_payload.as_ref().map_or(0, Bytes::len));
+        let mut tracker = self.begin_history_sync_task(0);
         tracker.set_processing_permits(permit, Some(replay_permit));
+        let notification: DetachedHistorySyncNotification = if notification.len()
+            >= INLINE_NOTIFICATION_ENCODING_THRESHOLD
+        {
+            // The borrowed API needs an owned input for the blocking worker.
+            // Bound each executor copy and yield even on runtimes without a
+            // yield implementation; decoding and inline copies run off-thread.
+            let mut encoded = Vec::with_capacity(notification.len());
+            for chunk in notification.chunks(64 * 1024) {
+                encoded.extend_from_slice(chunk);
+                let mut yielded = false;
+                futures::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            let mut lease = tracker.blocking_lease();
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let work = self.runtime.spawn_blocking(Box::new(move || {
+                let result = waproto::codec::history_sync_notification_decode(&encoded)
+                    .map(DetachedHistorySyncNotification::from);
+                if let Ok(notification) = &result {
+                    lease.set_payload_bytes(
+                        notification.inline_payload.as_ref().map_or(0, Bytes::len),
+                    );
+                }
+                let _ = tx.send(result);
+            }));
+            self.runtime.spawn(work).detach();
+            rx.await
+                .map_err(|_| anyhow::anyhow!("history notification decoder stopped"))??
+        } else {
+            let notification = waproto::codec::history_sync_notification_decode(notification)?;
+            let notification = DetachedHistorySyncNotification::from(notification);
+            tracker.set_payload_bytes(notification.inline_payload.as_ref().map_or(0, Bytes::len));
+            notification
+        };
         let Some((notification, mut tracker)) = self
             .capture_history_sync_notification(key, notification, tracker)
             .await?
@@ -687,7 +766,14 @@ impl Client {
             // pre-sizes its fresh retry buffer from the declared file length.
             // Reuse it here so a ~1 MiB history blob does not climb the Vec
             // doubling ladder (1 MiB -> 2 MiB) on every successful download.
-            match self.download(&notification, Default::default()).await {
+            let runtime: Arc<dyn wacore::runtime::Runtime> = Arc::new(HistoryDownloadRuntime {
+                inner: Arc::clone(&self.runtime),
+                tracker: tracker.blocking_lease(),
+            });
+            match self
+                .download_with_runtime(&notification, Default::default(), &runtime)
+                .await
+            {
                 Ok(bytes) => {
                     log::info!("Successfully downloaded history sync blob.");
                     // Payload accounting uses logical compressed bytes for
@@ -783,9 +869,9 @@ impl Client {
             Some((result, secret_collector.into_entries()))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
-            let processing_permits = tracker.processing_permits();
+            let lease = tracker.blocking_lease();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let _permits = processing_permits;
+                let _lease = lease;
                 let result = process_history_sync_bytes_with_record_sink(
                     compressed_data,
                     own_user.as_deref(),
