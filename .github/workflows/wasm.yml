@@ -82,7 +82,7 @@ jobs:
         run: >
           cargo build -p whatsapp-rust-sqlite-storage --lib --release
           --target wasm32-unknown-unknown
-          --no-default-features --features wacore/js
+          --no-default-features --features js
       # r2d2's pool and tokio's `spawn_blocking` both panic on a page, and both
       # compile there, so nothing but this check keeps them from creeping back into
       # the store once the shim exists.
