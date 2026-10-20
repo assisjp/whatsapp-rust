@@ -97,6 +97,9 @@ impl Maintenance {
     /// Does at most one transition. Writes are bounded and never cancelled by
     /// the stop signal: their outcome may be uncertain and needs compensation.
     pub async fn tick(&mut self, host: &impl Host, now: u64) {
+        // A completed cycle is local durable work, independent of connectivity.
+        // Failed storage must not prevent a new connection restoring offline.
+        let checkpoint_saved = self.flush_checkpoint(host).await;
         let generation = host.generation();
         if self.restored != generation {
             self.restored = None;
@@ -148,15 +151,12 @@ impl Maintenance {
             self.restored = Some(epoch);
             self.last_success = Some(now);
             self.pending_save = Some(now);
-        }
-        if let Some(timestamp) = self.pending_save {
-            // Retry persistence only, never another available transition.
-            if !write(host.save_success(timestamp), self.settings.write_timeout).await {
-                host.notice(Notice::CheckpointFailed);
+            if !self.flush_checkpoint(host).await {
                 return;
             }
-            self.pending_save = None;
-            host.notice(Notice::Completed);
+        }
+        if !checkpoint_saved {
+            return;
         }
         if !self.loaded {
             match tokio::time::timeout(self.settings.write_timeout, host.load_success()).await {
@@ -203,6 +203,19 @@ impl Maintenance {
         self.restored = Some(generation);
         self.pulse = Some((generation, Instant::now() + self.settings.available_for));
         host.notice(Notice::Available);
+    }
+
+    async fn flush_checkpoint(&mut self, host: &impl Host) -> bool {
+        let Some(timestamp) = self.pending_save else {
+            return true;
+        };
+        if !write(host.save_success(timestamp), self.settings.write_timeout).await {
+            host.notice(Notice::CheckpointFailed);
+            return false;
+        }
+        self.pending_save = None;
+        host.notice(Notice::Completed);
+        true
     }
 
     fn failed_restore(&mut self, host: &impl Host) {
@@ -263,6 +276,8 @@ pub async fn run(host: impl Host, settings: Settings, mut stop: watch::Receiver<
     if !state.restore(&host).await {
         state.restore(&host).await;
     }
+    // One bounded attempt even offline. An unfinished pulse has no checkpoint.
+    state.flush_checkpoint(&host).await;
 }
 
 #[cfg(test)]

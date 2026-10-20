@@ -144,8 +144,7 @@ struct Companion {
 impl Host for Companion {
     fn generation(&self) -> Option<u64> {
         let epoch = self.epoch.lock().unwrap_or_else(|p| p.into_inner());
-        (epoch.connected && self.client.is_socket_connected() && self.client.is_logged_in())
-            .then_some(epoch.counter)
+        (epoch.connected && self.client.is_session_ready()).then_some(epoch.counter)
     }
     async fn can_pulse(&self) -> bool {
         self.generation().is_some()

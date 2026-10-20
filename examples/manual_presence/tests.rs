@@ -9,6 +9,7 @@ use std::sync::{
 #[derive(Default)]
 struct Fake {
     epoch: AtomicU64,
+    ready: AtomicBool,
     allowed: AtomicBool,
     fail_available: AtomicBool,
     fail_unavailable: AtomicBool,
@@ -24,6 +25,7 @@ impl Fake {
     fn connected() -> Arc<Self> {
         Arc::new(Self {
             epoch: AtomicU64::new(1),
+            ready: AtomicBool::new(true),
             allowed: AtomicBool::new(true),
             ..Self::default()
         })
@@ -31,6 +33,9 @@ impl Fake {
 }
 impl Host for Arc<Fake> {
     fn generation(&self) -> Option<u64> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return None;
+        }
         match self.epoch.load(Ordering::SeqCst) {
             0 => None,
             n => Some(n),
@@ -255,6 +260,77 @@ async fn failed_checkpoint_write_retries_only_storage_without_another_pulse() {
         1
     );
 }
+#[tokio::test]
+async fn reconnect_login_without_session_readiness_cannot_complete_old_pulse() {
+    let host = Fake::connected();
+    let mut state = started(&host).await;
+    finish_interval(&mut state);
+    // Socket/login are back, but the new Connected event has not advanced epoch.
+    host.ready.store(false, Ordering::SeqCst);
+    state.tick(&host, 200).await;
+    assert_eq!(*host.saved.lock().unwrap(), None);
+    assert!(state.pulse.is_none());
+    host.epoch.store(2, Ordering::SeqCst);
+    host.ready.store(true, Ordering::SeqCst);
+    state.tick(&host, 300).await;
+    assert_eq!(host.writes.lock().unwrap().last(), Some(&"unavailable"));
+    assert_eq!(*host.saved.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn completed_checkpoint_retries_during_network_outage() {
+    let host = Fake::connected();
+    let mut state = started(&host).await;
+    finish_interval(&mut state);
+    host.fail_save.store(true, Ordering::SeqCst);
+    state.tick(&host, 200).await;
+    host.epoch.store(0, Ordering::SeqCst);
+    host.fail_save.store(false, Ordering::SeqCst);
+    state.tick(&host, 300).await;
+    assert_eq!(*host.saved.lock().unwrap(), Some(200));
+    assert!(host.notices.lock().unwrap().contains(&Notice::Completed));
+}
+
+#[tokio::test]
+async fn graceful_stop_drains_completed_checkpoint_while_offline() {
+    let host = Fake::connected();
+    host.fail_save.store(true, Ordering::SeqCst);
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(run(
+        host.clone(),
+        Settings {
+            available_for: Duration::ZERO,
+            poll_every: Duration::from_millis(100),
+            ..settings()
+        },
+        rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if host
+                .notices
+                .lock()
+                .unwrap()
+                .contains(&Notice::CheckpointFailed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    host.epoch.store(0, Ordering::SeqCst);
+    host.fail_save.store(false, Ordering::SeqCst);
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host.saved.lock().unwrap().is_some());
+    assert!(host.notices.lock().unwrap().contains(&Notice::Completed));
+}
+
 #[tokio::test]
 async fn disabled_pulses_still_restore_unavailable_on_reconnect() {
     let host = Fake::connected();
