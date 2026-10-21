@@ -372,6 +372,9 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_rtp_completed_timestamp: now
             .video_rtp_completed_timestamp
             .saturating_sub(then.video_rtp_completed_timestamp),
+        video_access_units_shared_timestamp: now
+            .video_access_units_shared_timestamp
+            .saturating_sub(then.video_access_units_shared_timestamp),
         video_fu_dropped_sequence_gap: now
             .video_fu_dropped_sequence_gap
             .saturating_sub(then.video_fu_dropped_sequence_gap),

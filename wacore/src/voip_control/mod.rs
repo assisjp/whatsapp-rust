@@ -600,6 +600,11 @@ pub struct MediaStats {
     /// whose marker already completed it.
     #[builder(default)]
     pub video_rtp_completed_timestamp: u32,
+    /// Access units that began on the RTP timestamp of the one before them and were told apart by
+    /// the sender's later media time offset: pictures that would otherwise have been discarded as
+    /// late packets of their predecessor.
+    #[builder(default)]
+    pub video_access_units_shared_timestamp: u32,
     /// Partially reassembled FU-A NALs dropped because a fragment's sequence number skipped.
     #[builder(default)]
     pub video_fu_dropped_sequence_gap: u32,

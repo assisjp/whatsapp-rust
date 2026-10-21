@@ -31,6 +31,7 @@ use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
+    group_call_min_remote_participants,
 };
 #[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::transport::RelayTransportFactory;
@@ -794,7 +795,8 @@ impl<'a> OutgoingCall<'a> {
     }
 }
 
-/// Builder for a native ad-hoc or group-bound call with at least two remote users.
+/// Builder for a native ad-hoc call with at least two remote users, or a group-bound call with at
+/// least one.
 pub struct OutgoingGroupCall<'a> {
     client: &'a Client,
     targets: &'a [Jid],
@@ -846,6 +848,17 @@ impl<'a> OutgoingGroupCall<'a> {
                 "video RTP timestamp stride must be non-zero",
             ));
         }
+        let min_remote = group_call_min_remote_participants(self.group_jid.is_some());
+        let roster_error = || {
+            let kind = if self.group_jid.is_some() {
+                "group-bound"
+            } else {
+                "group"
+            };
+            CallError::Setup(format!(
+                "{kind} call requires {min_remote}..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+            ))
+        };
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let own_user = own_lid.to_non_ad();
         let own_pn = self.client.pn().map(|jid| jid.to_non_ad());
@@ -863,9 +876,7 @@ impl<'a> OutgoingGroupCall<'a> {
             candidates.push(target);
         }
         if candidates.len() > GROUP_CALL_MAX_REMOTE_PARTICIPANTS {
-            return Err(CallError::Setup(format!(
-                "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-            )));
+            return Err(roster_error());
         }
         let resolved = futures::future::join_all(candidates.into_iter().map(|target| async move {
             match target.server {
@@ -897,15 +908,11 @@ impl<'a> OutgoingGroupCall<'a> {
             }
             targets.push(resolved);
             if targets.len() > GROUP_CALL_MAX_REMOTE_PARTICIPANTS {
-                return Err(CallError::Setup(format!(
-                    "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-                )));
+                return Err(roster_error());
             }
         }
-        if !(2..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS).contains(&targets.len()) {
-            return Err(CallError::Setup(format!(
-                "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-            )));
+        if !(min_remote..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS).contains(&targets.len()) {
+            return Err(roster_error());
         }
 
         let devices = drop_hosted_devices(
@@ -5307,8 +5314,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
+    /// A client whose own PN and LID are set, whose `peers` each have one device on record, and
+    /// whose group cache holds a group of the local user (under both identities) and `peers`.
+    async fn group_call_client(peers: &[&Jid]) -> (Arc<Client>, Jid, Jid) {
         use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::message::AddressingMode;
@@ -5322,9 +5330,7 @@ mod tests {
         ] {
             client.persistence_manager().process_command(command).await;
         }
-        let peer_a = Jid::new("222222222222222", Server::Lid);
-        let peer_b = Jid::new("333333333333333", Server::Lid);
-        for peer in [&peer_a, &peer_b] {
+        for peer in peers {
             client
                 .update_device_list(DeviceListRecord {
                     user: peer.user.as_str().into(),
@@ -5337,17 +5343,20 @@ mod tests {
                 .expect("seed device list");
         }
         let group = Jid::new("120363000000000001", Server::Group);
+        let mut members = vec![own_pn, own_lid.to_non_ad()];
+        members.extend(peers.iter().map(|peer| (*peer).clone()));
         client
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupRoutingInfo::new(
-                    vec![own_pn, own_lid.to_non_ad(), peer_a.clone(), peer_b.clone()],
-                    AddressingMode::Lid,
-                )),
+                Arc::new(GroupRoutingInfo::new(members, AddressingMode::Lid)),
             )
             .await;
+        (client, own_lid, group)
+    }
 
+    /// Start a call to `group`'s roster and return the offer it sends, as the users it rings.
+    async fn group_offer_users(client: &Arc<Client>, group: &Jid) -> Vec<Jid> {
         let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         let start_client = client.clone();
         let start_group = group.clone();
@@ -5366,7 +5375,7 @@ mod tests {
         let offer = &node_ref.children().expect("call action")[0];
         assert_eq!(
             offer.attrs().optional_jid("group-jid"),
-            Some(group),
+            Some(group.clone()),
             "the roster-derived call must remain bound to its source group"
         );
         let users = offer
@@ -5377,14 +5386,79 @@ mod tests {
             .iter()
             .map(|user| user.attrs().optional_jid("jid").expect("user jid"))
             .collect::<Vec<_>>();
+        start.abort();
+        let _ = start.await;
+        users
+    }
+
+    #[tokio::test]
+    async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
+        let peer_a = Jid::new("222222222222222", Server::Lid);
+        let peer_b = Jid::new("333333333333333", Server::Lid);
+        let (client, own_lid, group) = group_call_client(&[&peer_a, &peer_b]).await;
+
         assert_eq!(
-            users,
+            group_offer_users(&client, &group).await,
             [own_lid.to_non_ad(), peer_a, peer_b],
             "the own PN and LID roster entries must collapse into the single local participant"
         );
+    }
 
-        start.abort();
-        let _ = start.await;
+    #[tokio::test]
+    async fn a_two_person_group_call_rings_its_other_member() {
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let (client, own_lid, group) = group_call_client(&[&peer]).await;
+
+        assert_eq!(
+            group_offer_users(&client, &group).await,
+            [own_lid.to_non_ad(), peer],
+            "a group-bound call needs only one other member"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_with_no_other_member_cannot_be_called() {
+        let (client, _own_lid, group) = group_call_client(&[]).await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = client
+            .voip()
+            .group_call_by_id(&group)
+            .audio(mic_rx, speaker_tx)
+            .start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(CallError::Setup(message))
+                if message
+                    == format!(
+                        "group-bound call requires 1..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_ad_hoc_group_call_still_needs_two_remote_users() {
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let (client, _own_lid, _group) = group_call_client(&[&peer]).await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = client
+            .voip()
+            .group_call(std::slice::from_ref(&peer))
+            .audio(mic_rx, speaker_tx)
+            .start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(CallError::Setup(message))
+                if message
+                    == format!(
+                        "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+                    )
+        ));
     }
 
     #[tokio::test]

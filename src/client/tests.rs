@@ -3804,6 +3804,9 @@ fn client_size_pins_runtime_cache_config_saving() {
     }
     expected += size_of::<AppStateDownloads>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
+    // Opt-in history recovery keeps one additional immutable hook cell.
+    // Derive its cost from the representation; do not loosen the fixed base.
+    expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
     // Immutable retry policies and handler map replace their synchronization cells.

@@ -1145,23 +1145,28 @@ impl VideoPipeline {
             self.retired_ssrc_run = 0;
             self.contender_ssrc = None;
         }
-        let previous = self.frame_orientation;
-        let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
-        match self.frame_orientation {
-            Some((timestamp, ref mut orientation)) if timestamp == header.timestamp => {
-                if rotation.is_some() {
-                    *orientation = rotation;
-                }
-            }
-            Some((timestamp, _)) if (header.timestamp.wrapping_sub(timestamp) as i32) <= 0 => {}
-            _ => self.frame_orientation = Some((header.timestamp, rotation)),
-        }
-        let first = self.depacketizer.push(
+        let first = self.depacketizer.push_with_time_offset(
             header.sequence_number,
             header.timestamp,
+            super::rtp::parse_whatsapp_media_time_offset(packet),
             &payload,
             header.marker,
         );
+        // Keyed by the timestamp the depacketizer hands the picture out with, which is not the RTP
+        // timestamp for a picture sharing its predecessor's.
+        let previous = self.frame_orientation;
+        if let Some(picture) = self.depacketizer.last_packet_timestamp() {
+            let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
+            match self.frame_orientation {
+                Some((timestamp, ref mut orientation)) if timestamp == picture => {
+                    if rotation.is_some() {
+                        *orientation = rotation;
+                    }
+                }
+                Some((timestamp, _)) if (picture.wrapping_sub(timestamp) as i32) <= 0 => {}
+                _ => self.frame_orientation = Some((picture, rotation)),
+            }
+        }
         let mut completed = Vec::with_capacity(if first.is_some() { 2 } else { 0 });
         // Ready AUs are drained after every push, so at most the previous unmarked
         // AU and the current AU complete here. Keep each one's own orientation.
@@ -1971,6 +1976,35 @@ mod tests {
             None,
             "an absent extension must not inherit the previous camera rotation"
         );
+    }
+
+    // A picture an iPhone sent on its predecessor's RTP timestamp, told apart by a media time
+    // offset one frame interval later: reassembled as its own access unit, with its own rotation.
+    #[test]
+    fn picture_on_a_shared_timestamp_keeps_its_own_timestamp_and_rotation() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        let mut send = |info: u8, offset: i16, timestamp: u32| {
+            let mut header = tx.rtp.next_video_packet(true, info);
+            header.timestamp = timestamp;
+            if let Some(extension) = header.video_extension.as_mut() {
+                extension.short_offset = offset;
+            }
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            rx.unprotect_video_packet(&packet).unwrap().1
+        };
+        let au = vec![0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(send(1, 12, 9000), vec![(9000, au.clone(), Some(1))]);
+        assert_eq!(
+            send(2, 79, 9000),
+            vec![(9000 + 67 * 90, au.clone(), Some(2))],
+            "the second picture is neither discarded nor given the first one's rotation"
+        );
+        assert_eq!(send(3, 12, 21_000), vec![(21_000, au, Some(3))]);
     }
 
     #[test]

@@ -2208,6 +2208,10 @@ pub struct Client {
     pub(crate) group_notification_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>,
 
+    /// Notification recovery shares the inbound journal, independently of capture.
+    pub(crate) history_sync_durability_hook:
+        std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>,
+
     /// History capture is independent of message durability and immutable after build.
     pub(crate) history_sync_capture_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::HistorySyncCaptureHook>>,

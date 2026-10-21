@@ -978,6 +978,10 @@ fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
             d.packets_completed_timestamp,
         ),
         (
+            &mut stats.video_access_units_shared_timestamp,
+            d.access_units_shared_timestamp,
+        ),
+        (
             &mut stats.video_fu_dropped_sequence_gap,
             d.fu_dropped_sequence_gap,
         ),

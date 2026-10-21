@@ -267,6 +267,33 @@ pub fn parse_whatsapp_media_frame_info(data: &[u8]) -> Option<u8> {
     info.into_iter().flatten().next()
 }
 
+/// Read the media time offset (one-byte extension element 6, `short_offset` in
+/// [`VideoRtpExtension`]) independently of the other 0xdebe extensions: a signed
+/// millisecond offset from the RTP timestamp. Packets of one picture carry the
+/// same value, or one 1 ms later; see [`super::h264::H264Depacketizer::push_with_time_offset`]
+/// for a picture told apart by it. A truncated element ends the scan.
+pub fn parse_whatsapp_media_time_offset(data: &[u8]) -> Option<i16> {
+    let (Some(WHATSAPP_RTP_EXTENSION_PROFILE), mut extension) =
+        rtp_extension_profile_and_data(data)?
+    else {
+        return None;
+    };
+    while let Some((&header, rest)) = extension.split_first() {
+        extension = rest;
+        let id = header >> 4;
+        if id == 0 {
+            continue;
+        }
+        let len = usize::from(header & 0x0f) + 1;
+        let (value, rest) = extension.split_at_checked(len)?;
+        extension = rest;
+        if id == 6 && len == 2 {
+            return Some(i16::from_be_bytes([value[0], value[1]]));
+        }
+    }
+    None
+}
+
 /// RFC 8285's one-byte header extension profile. WhatsApp's own stack registers its one-byte
 /// element parser under this profile as well as under [`WHATSAPP_RTP_EXTENSION_PROFILE`].
 pub const RFC8285_ONE_BYTE_EXTENSION_PROFILE: u16 = 0xbede;
@@ -646,8 +673,10 @@ impl VideoRtpStream {
             video_extension: Some(VideoRtpExtension {
                 media_frame_info,
                 initial_bandwidth: 0,
-                // The real sender reported 29 ticks (~0.3 ms). Zero is the truthful value when
-                // the API has no capture-time origin to subtract from the RTP timestamp.
+                // The real sender reported 29. The unit is milliseconds: an iPhone's offset steps
+                // by one frame interval (about 67 at 15 fps) between pictures sharing an RTP
+                // timestamp. Zero is the truthful value when the API has no capture-time origin
+                // to subtract from the RTP timestamp.
                 short_offset: 0,
                 transport_sequence: self.transport_sequence,
             }),
@@ -967,6 +996,53 @@ mod tests {
     }
 
     #[test]
+    fn media_time_offset_reads_element_six_alone() {
+        let header = |extension: &[u8]| {
+            let mut packet = vec![
+                0x90,
+                RTP_PAYLOAD_TYPE_H264,
+                0,
+                1,
+                0,
+                0,
+                0x2a,
+                0xf8,
+                0,
+                0,
+                0,
+                1,
+            ];
+            packet.extend_from_slice(&WHATSAPP_RTP_EXTENSION_PROFILE.to_be_bytes());
+            packet.extend_from_slice(&((extension.len() / 4) as u16).to_be_bytes());
+            packet.extend_from_slice(extension);
+            packet
+        };
+        // Only the offset, after padding, negative.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x00, 0x61, 0xff, 0x9c])),
+            Some(-100)
+        );
+        // Behind the frame info, with none of the other elements.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x30, 0x08, 0x61, 0x00, 0x4f, 0, 0, 0])),
+            Some(79)
+        );
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x30, 0x08, 0, 0])),
+            None
+        );
+        // Truncated: the value runs past the block.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x00, 0x00, 0x61, 0x00])),
+            None
+        );
+        let mut plain = header(&[]);
+        plain[0] = 0x80;
+        plain.truncate(RTP_FIXED_HEADER_LEN);
+        assert_eq!(parse_whatsapp_media_time_offset(&plain), None);
+    }
+
+    #[test]
     fn video_header_matches_android_capture() {
         let k = kats();
         let captured = hex::decode(k["rtp"]["androidVideoHeader28"].as_str().unwrap()).unwrap();
@@ -992,6 +1068,7 @@ mod tests {
                 }),
             })
         );
+        assert_eq!(parse_whatsapp_media_time_offset(&captured), Some(29));
     }
 
     #[test]
@@ -1021,6 +1098,7 @@ mod tests {
                 }),
             })
         );
+        assert_eq!(parse_whatsapp_media_time_offset(&captured), Some(36));
         assert_eq!(
             VIDEO_MEDIA_FRAME_INFO_IDR,
             VIDEO_MEDIA_FRAME_INFO_DELTA | 0x08

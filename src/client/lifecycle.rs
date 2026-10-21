@@ -325,6 +325,12 @@ impl Client {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
 
+    /// A permanent verdict, independent of whether the host has started a run
+    /// loop or enabled reconnects. Local durable replay also works before run.
+    pub(crate) fn is_permanently_stopped(&self) -> bool {
+        self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal()
+    }
+
     /// Whether the client is finished for good, as opposed to being between
     /// connections.
     ///
@@ -349,7 +355,7 @@ impl Client {
     /// waiter parked on a connection that is never coming has no other way to
     /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
-        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
+        if self.is_permanently_stopped() {
             return true;
         }
         // The reconnect preference alone is not proof: an application may
@@ -528,6 +534,7 @@ impl Client {
             plugin_host,
             inbound_durability_hook,
             history_sync_capture_hook,
+            history_sync_durability_hook,
             group_notification_durability_hook,
             custom_enc_handlers,
             retry_admission,
@@ -749,6 +756,9 @@ impl Client {
             chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers,
             inbound_durability_hook: inbound_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            history_sync_durability_hook: history_sync_durability_hook
                 .map(std::sync::OnceLock::from)
                 .unwrap_or_default(),
             history_sync_capture_hook: history_sync_capture_hook
@@ -2373,7 +2383,11 @@ impl Client {
             Err(poison) => *poison.into_inner() = None,
         }
         drop(terminal_gate);
-        self.history_sync_activity.reset();
+        // Durable hooks and blocking leases can outlive this socket. Their
+        // trackers must remain in the accounting generation until they drop.
+        if self.history_sync_durability_hook.get().is_none() {
+            self.history_sync_activity.reset();
+        }
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
         // Scoped so the sync guard is dropped before the awaits below (a
