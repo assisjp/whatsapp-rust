@@ -35,9 +35,7 @@ impl Client {
         let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise
         // sender task at the actual transport write.
-        noise_socket
-            .encrypt_and_send(bytes::Bytes::from(plaintext))
-            .await?;
+        noise_socket.encrypt_and_send(plaintext.into()).await?;
         Ok(())
     }
 
@@ -67,10 +65,20 @@ impl Client {
     /// [`MAX_INLINE_BURST`](Self::MAX_INLINE_BURST), so it does not allocate
     /// either; beyond that the spill is one allocation, which is what the
     /// previous `join_all` cost every time.
-    pub(crate) async fn send_raw_bytes_burst(
+    pub(crate) async fn send_raw_bytes_burst<P: Into<bytes::Bytes>>(
         &self,
-        frames: &mut Vec<Vec<u8>>,
+        frames: &mut Vec<P>,
         results: &mut Vec<crate::socket::error::EncryptSendResult>,
+    ) -> Result<(), ClientError> {
+        self.send_raw_bytes_burst_scoped(frames, results, None)
+            .await
+    }
+
+    pub(crate) async fn send_raw_bytes_burst_scoped<P: Into<bytes::Bytes>>(
+        &self,
+        frames: &mut Vec<P>,
+        results: &mut Vec<crate::socket::error::EncryptSendResult>,
+        shutdown: Option<&wacore::runtime::ShutdownSignal>,
     ) -> Result<(), ClientError> {
         results.clear();
         let noise_socket = match self.get_noise_socket() {
@@ -80,13 +88,16 @@ impl Client {
                 return Err(error);
             }
         };
+        // Capture the socket before checking the original scope. A reconnect
+        // after this check can only leave us sending to the old socket; it can
+        // never redirect an old ACK onto the replacement connection.
+        if shutdown.is_some_and(wacore::runtime::ShutdownSignal::is_fired) {
+            frames.clear();
+            return Err(ClientError::NotConnected);
+        }
         if frames.len() == 1 {
             let plaintext = frames.pop().expect("length checked");
-            results.push(
-                noise_socket
-                    .encrypt_and_send(bytes::Bytes::from(plaintext))
-                    .await,
-            );
+            results.push(noise_socket.encrypt_and_send(plaintext.into()).await);
             return Ok(());
         }
         // Every frame is enqueued before any is awaited, which is what lets the
@@ -107,10 +118,7 @@ impl Client {
                 frames_after_enqueue_failed += 1;
                 continue;
             }
-            match noise_socket
-                .enqueue_send(bytes::Bytes::from(plaintext))
-                .await
-            {
+            match noise_socket.enqueue_send(plaintext.into()).await {
                 Ok(receiver) => receivers.push(receiver),
                 Err(_) => frames_after_enqueue_failed = 1,
             }
@@ -465,25 +473,6 @@ impl Client {
     }
 
     /// Register a oneshot waiter for a server ack by message ID.
-    /// Returns the receiver — caller sends the node separately and awaits this in background.
-    /// Sync: registration is just a `std::sync::Mutex` insert (no await).
-    /// Register a waiter that receives the ack node itself.
-    ///
-    /// VoIP reads the relay from its ACK. Group-history uses the guarded,
-    /// non-replacing variant below so concurrent retries cannot steal waiters.
-    /// A phash check does not need the node, which is why ordinary sends use
-    /// [`Self::register_phash_waiter`].
-    #[cfg(feature = "voip-control")]
-    pub(crate) fn register_ack_waiter(
-        &self,
-        message_id: &str,
-    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.response_waiters_guard()
-            .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
-        rx
-    }
-
     /// Register an ACK waiter only if this message ID is not already pending.
     /// Returns the entry generation so timeout cleanup cannot remove a newer
     /// waiter that reuses the same ID after this one was consumed.

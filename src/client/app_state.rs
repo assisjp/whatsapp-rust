@@ -1027,10 +1027,7 @@ impl Client {
         self: &Arc<Self>,
         receiver: async_channel::Receiver<MajorSyncTask>,
     ) {
-        const HISTORY_SYNC_CONCURRENCY: usize = 2;
-
         let worker_client = Arc::downgrade(self);
-        let history_permits = Arc::new(async_lock::Semaphore::new(HISTORY_SYNC_CONCURRENCY));
         self.runtime
             .spawn(Box::pin(async move {
                 while let Ok(task) = receiver.recv().await {
@@ -1038,14 +1035,21 @@ impl Client {
                         break;
                     };
 
-                    if matches!(task, MajorSyncTask::HistorySync { .. }) {
-                        let permit = history_permits.acquire_arc().await;
+                    if let MajorSyncTask::HistorySync {
+                        message_id,
+                        notification,
+                        mut tracker,
+                    } = task {
+                        let Some(permit) = worker_client.acquire_history_sync_permit().await else {
+                            continue;
+                        };
                         let task_client = worker_client.clone();
                         worker_client
                             .runtime
                             .spawn(Box::pin(async move {
-                                let _permit = permit;
-                                task_client.process_sync_task(task).await;
+                                task_client.process_history_sync_task_with_permit(
+                                    message_id, *notification, &mut tracker, permit,
+                                ).await;
                             }))
                             .detach();
                     } else {

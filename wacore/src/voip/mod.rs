@@ -105,7 +105,7 @@ pub use opus_packet::{OpusBandwidth, OpusMode, OpusPacketShape, opus_packet_shap
 pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
 pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
-    VideoPipelineParams,
+    VideoPipelineParams, VideoReassemblyStats,
 };
 pub use tap::{InMemoryTap, PacketDir, PacketTap, TappedFactory, TappedTransport};
 pub use transport::{
@@ -202,6 +202,7 @@ mod fuzz_tests {
                 let _ = rtp::rtp_header_byte_length(&b);
                 let _ = rtp::parse_rtp_header(&b);
                 let _ = rtp::parse_whatsapp_media_frame_info(&b);
+                let _ = rtp::parse_whatsapp_media_time_offset(&b);
                 // RTCP
                 let _ = rtcp::is_rtcp_packet(&b);
                 let _ = rtcp::rtcp_payload_type(&b);

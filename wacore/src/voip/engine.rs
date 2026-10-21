@@ -49,7 +49,7 @@ use super::rtp::{
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, SrtpReceiveError, VideoPipeline,
-    VideoPipelineParams,
+    VideoPipelineParams, VideoReassemblyStats,
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
@@ -947,6 +947,69 @@ impl VideoPlaneState {
         };
         self.inbound_expected = Some((ssrc, sequence.wrapping_add(1)));
         missing
+    }
+}
+
+/// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
+/// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
+/// with it.
+fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
+    let d = &r.depacketizer;
+    for (total, delta) in [
+        (
+            &mut stats.video_access_units_completed,
+            d.access_units_completed,
+        ),
+        (
+            &mut stats.video_access_units_without_marker,
+            d.access_units_without_marker,
+        ),
+        (&mut stats.video_access_units_empty, d.access_units_empty),
+        (
+            &mut stats.video_access_units_evicted,
+            d.access_units_evicted,
+        ),
+        (
+            &mut stats.video_rtp_stale_timestamp,
+            d.packets_stale_timestamp,
+        ),
+        (
+            &mut stats.video_rtp_completed_timestamp,
+            d.packets_completed_timestamp,
+        ),
+        (
+            &mut stats.video_access_units_shared_timestamp,
+            d.access_units_shared_timestamp,
+        ),
+        (
+            &mut stats.video_fu_dropped_sequence_gap,
+            d.fu_dropped_sequence_gap,
+        ),
+        (
+            &mut stats.video_fu_dropped_timestamp_boundary,
+            d.fu_dropped_timestamp_boundary,
+        ),
+        (
+            &mut stats.video_fu_dropped_unterminated,
+            d.fu_dropped_unterminated,
+        ),
+        (&mut stats.video_fu_orphan_fragments, d.fu_orphan_fragments),
+        (
+            &mut stats.video_nal_oversize_dropped,
+            d.nal_oversize_dropped,
+        ),
+        (&mut stats.video_payload_unusable, d.payload_unusable),
+        (&mut stats.video_ssrc_switches, r.ssrc_switches),
+        (
+            &mut stats.video_ssrc_switch_partial_dropped,
+            r.ssrc_switch_partial_dropped,
+        ),
+        (
+            &mut stats.video_retired_ssrc_ignored,
+            r.retired_ssrc_ignored,
+        ),
+    ] {
+        *total = total.saturating_add(delta);
     }
 }
 
@@ -2993,6 +3056,8 @@ impl CallEngine {
             let mut piggybacked = None;
             // Packets of the peer's picture that never arrived, acted on once the media borrow ends.
             let mut video_lost = 0u16;
+            // What reassembly did with the packet, folded in once the media borrow ends.
+            let mut reassembly = None;
             // The clear extension identifies an audio arrival even when its tag fails.
             // Pure video must not keep the audio watchdog alive.
             if audio_carrier {
@@ -3001,14 +3066,18 @@ impl CallEngine {
             }
             let received = match m.video.as_mut() {
                 Some(v) if v.active => match v.pipe.unprotect_video_packet_split(pkt) {
-                    Ok((header, completed, audio)) => {
-                        v.reception.observe(
-                            header.ssrc,
-                            header.sequence_number,
-                            header.timestamp,
-                            now,
-                            VIDEO_CLOCK_RATE,
-                        );
+                    Ok((header, completed, audio, received_payload_len)) => {
+                        reassembly = Some(v.pipe.take_reassembly_stats());
+                        if v.pipe.inbound_ssrc() == Some(header.ssrc) {
+                            v.reception.observe(
+                                header.ssrc,
+                                header.sequence_number,
+                                header.timestamp,
+                                now,
+                                VIDEO_CLOCK_RATE,
+                            );
+                            v.reception.count_payload(header.ssrc, received_payload_len);
+                        }
                         video_lost = v.missing_before(header.ssrc, header.sequence_number);
                         if video_lost > 0 {
                             v.inbound_gap_timestamp = Some(header.timestamp);
@@ -3066,6 +3135,9 @@ impl CallEngine {
                     self.media_stats.srtp_unprotect_failed =
                         self.media_stats.srtp_unprotect_failed.saturating_add(1);
                 }
+            }
+            if let Some(reassembly) = reassembly {
+                fold_video_reassembly(&mut self.media_stats, &reassembly);
             }
             if let Some(audio) = piggybacked {
                 self.on_piggybacked_audio(now, &audio);
@@ -3135,7 +3207,10 @@ impl CallEngine {
             return;
         }
         match m.pipe.unprotect_audio_checked(pkt) {
-            Ok((header, payload)) => self.on_audio_rtp(now, header, payload),
+            Ok((header, payload)) => {
+                let payload_len = super::rtp::received_payload_len(pkt, &payload);
+                self.on_audio_rtp(now, header, payload, payload_len);
+            }
             Err(SrtpReceiveError::AuthenticationFailed) => {
                 self.media_stats.srtp_unprotect_failed =
                     self.media_stats.srtp_unprotect_failed.saturating_add(1);
@@ -3191,12 +3266,18 @@ impl CallEngine {
             .media_stats
             .piggybacked_audio_received
             .saturating_add(1);
-        self.on_audio_rtp(now, header, payload.to_vec());
+        self.on_audio_rtp(now, header, payload.to_vec(), payload.len());
     }
 
     /// The audio receive path from an authenticated, decrypted RTP packet onwards: reception
     /// statistics, SFrame, and the decoder the packet's codec selects.
-    fn on_audio_rtp(&mut self, now: Millis, header: crate::voip::rtp::RtpHeader, payload: Vec<u8>) {
+    fn on_audio_rtp(
+        &mut self,
+        now: Millis,
+        header: crate::voip::rtp::RtpHeader,
+        payload: Vec<u8>,
+        payload_len: usize,
+    ) {
         // Set by the content probe below and applied once the media borrow has ended: the switch
         // needs the whole engine, and holding both borrows would be a borrow-checker fight for no
         // behavioural gain. The encoded path keeps its own, since it returns before the tail. Not
@@ -3220,6 +3301,7 @@ impl CallEngine {
             now,
             m.audio.format.rtp_clock_rate,
         );
+        m.audio_reception.count_payload(header.ssrc, payload_len);
         // Set when the payload reaching the codec is ciphertext whose tag did not authenticate. Such
         // bytes are passed through by contract but they are NOT evidence about anything: they are
         // whatever the wrong key produced, and three of them structurally resembling 60ms Opus would
@@ -3544,17 +3626,18 @@ impl CallEngine {
             let Some(video) = group.registry.unprotect_video(pkt) else {
                 return;
             };
-            group
+            let reception = group
                 .video_reception
                 .entry(video.participant_id.clone())
-                .or_default()
-                .observe(
-                    video.header.ssrc,
-                    video.header.sequence_number,
-                    video.header.timestamp,
-                    now,
-                    VIDEO_CLOCK_RATE,
-                );
+                .or_default();
+            reception.observe(
+                video.header.ssrc,
+                video.header.sequence_number,
+                video.header.timestamp,
+                now,
+                VIDEO_CLOCK_RATE,
+            );
+            reception.count_payload(video.header.ssrc, video.payload_len);
             let orientation = group
                 .video_orientations
                 .get(&video.device_jid)
@@ -3663,17 +3746,21 @@ impl CallEngine {
         {
             probe.stream_restarted();
         }
-        group
+        let reception = group
             .audio_reception
             .entry(participant.participant_id.clone())
-            .or_default()
-            .observe(
-                participant.header.ssrc,
-                participant.header.sequence_number,
-                participant.header.timestamp,
-                now,
-                audio.format.rtp_clock_rate,
-            );
+            .or_default();
+        reception.observe(
+            participant.header.ssrc,
+            participant.header.sequence_number,
+            participant.header.timestamp,
+            now,
+            audio.format.rtp_clock_rate,
+        );
+        reception.count_payload(
+            participant.header.ssrc,
+            super::rtp::received_payload_len(pkt, &participant.payload),
+        );
         // The latched promotion is consulted FIRST, because the escape marker cannot tell the two
         // apart: `is_mlow_embedded_opus` tests the top two bits, and every native Opus CELT config
         // (24..=31) sets them -- a native 60ms CELT packet starts 0xC3. Read marker-first, a
@@ -9404,6 +9491,79 @@ mod tests {
     }
 
     #[test]
+    fn group_reception_counts_authenticated_payload_before_video_reassembly() {
+        let (mut eng, epoch) = group_engine(true);
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        let mut audio = group_peer_audio(&epoch);
+        let mut video = group_peer_video(&epoch);
+        let audio_packet = audio.protect_audio(&[0xf8, 0xff, 0xfe]);
+        eng.handle_input(1, Input::RelayPacket(&audio_packet));
+        let packets = video.protect_video(&video_au(4000));
+        assert!(packets.len() > 1);
+        // Only a fragment arrives, so no access unit is available to count.
+        eng.handle_input(2, Input::RelayPacket(&packets[0]));
+        let mut forged = packets[1].clone();
+        *forged.last_mut().unwrap() ^= 1;
+        eng.handle_input(3, Input::RelayPacket(&forged));
+        eng.handle_input(4, Input::RelayPacket(&packets[0]));
+        let group = eng.group.as_mut().unwrap();
+        let audio = group
+            .audio_reception
+            .get_mut(&peer_id)
+            .unwrap()
+            .report(100)
+            .unwrap();
+        let video = group
+            .video_reception
+            .get_mut(&peer_id)
+            .unwrap()
+            .report(100)
+            .unwrap();
+        assert_eq!(audio.bytes_received, 3);
+        let header_len = super::super::rtp::rtp_header_byte_length(&packets[0]).unwrap();
+        assert_eq!(
+            video.bytes_received as usize,
+            packets[0].len() - header_len - WARP_MI_TAG_LEN
+        );
+    }
+
+    #[test]
+    fn retired_video_packets_preserve_active_reception_totals_and_report_time() {
+        let (mut eng, mut departed) = video_engine_with_inbound_stream();
+        let mut live = peer_video_pipe_with_ssrc(departed.send_ssrc() ^ 0x5a5a5a5a);
+        let packet = live.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(200, Input::RelayPacket(&packet));
+        let report = eng
+            .media
+            .as_mut()
+            .unwrap()
+            .video
+            .as_mut()
+            .unwrap()
+            .reception
+            .report(300)
+            .unwrap();
+        assert_eq!(report.bytes_received, 101);
+        let straggler = departed.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(400, Input::RelayPacket(&straggler));
+        let packet = live.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(500, Input::RelayPacket(&packet));
+        let report = eng
+            .media
+            .as_mut()
+            .unwrap()
+            .video
+            .as_mut()
+            .unwrap()
+            .reception
+            .report(1300)
+            .unwrap();
+        assert_eq!(report.ssrc, live.send_ssrc());
+        assert_eq!(report.bytes_received, 202);
+        assert_eq!(report.receive_rate_bps, 808);
+    }
+
+    #[test]
     fn group_sender_reports_update_only_the_matching_reception_stream() {
         let (mut eng, epoch) = group_engine(true);
         let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
@@ -10065,14 +10225,80 @@ mod tests {
         let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
         assert_eq!(&plain[..4], &[0x91, RTCP_PT_SR, 0, 18]);
         assert_eq!(&plain[28..32], &peer_video_ssrc.to_be_bytes());
-        assert_eq!(&plain[52..76], &[0; 24]);
+        assert_eq!(&plain[52..56], &101u32.to_be_bytes());
+        assert_eq!(&plain[56..76], &[0; 20]);
         assert_eq!(&plain[76..80], &[0x91, RTCP_PT_SDES, 0, 7]);
         let summary = summarize_rtcp(&plain).unwrap();
         assert_eq!(summary.packet_types, [RTCP_PT_SR, RTCP_PT_SDES]);
         assert_eq!(summary.referenced_ssrcs, [peer_video_ssrc]);
         assert_eq!(summary.report_blocks.len(), 1);
-        assert_eq!(summary.report_blocks[0].profile_extension, [0; 24]);
+        let mut expected = [0; 24];
+        expected[..4].copy_from_slice(&101u32.to_be_bytes());
+        assert_eq!(summary.report_blocks[0].profile_extension, expected);
         assert!(summary.uses_whatsapp_profile_extension);
+
+        let check_report = |outputs: &[Output], local_ssrc, bytes: u32, rate: u32| {
+            let packet = outputs
+                .iter()
+                .find_map(|output| match output {
+                    Output::Transmit(packet)
+                        if parse_rtcp_sender_ssrc(packet) == Some(local_ssrc) =>
+                    {
+                        Some(packet)
+                    }
+                    _ => None,
+                })
+                .expect("stream Sender Report");
+            let (plain, _) = unprotect_srtcp(&transport, local_ssrc, packet).unwrap();
+            assert_eq!(&plain[52..56], &bytes.to_be_bytes());
+            assert_eq!(&plain[56..72], &[0; 16]);
+            assert_eq!(&plain[72..76], &rate.to_be_bytes());
+        };
+        let local_audio_ssrc = eng.media.as_ref().unwrap().pipe.send_ssrc();
+        check_report(&outs, local_audio_ssrc, 3, 0);
+
+        // Authentication failures and replays must not increase either stream's totals.
+        let mut forged = peer_video.protect_video(&video_au(70)).pop().unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+        eng.handle_input(RTCP_MS + 10, Input::RelayPacket(&forged));
+        eng.handle_input(RTCP_MS + 11, Input::RelayPacket(&video));
+        eng.handle_input(RTCP_MS + 12, Input::RelayPacket(&audio));
+        // The carrier contributes its entire authenticated payload, including embedded RTP.
+        // The audio stream independently counts the embedded codec payload.
+        let carried_audio = plain_peer_audio(
+            parse_rtp_header(&audio).unwrap().payload_type,
+            10,
+            &[0xf8, 0xff, 0xfe],
+        );
+        let carrier = peer_packet_carrying_audio_with_padding(
+            RTP_PAYLOAD_TYPE_H264,
+            peer_video_ssrc,
+            20,
+            &[0x41, 1, 2, 3, 0, 0, 3],
+            &carried_audio,
+            true,
+        );
+        eng.handle_input(RTCP_MS + 20, Input::RelayPacket(&carrier));
+        let padded_audio = peer_packet_carrying_audio_with_padding(
+            parse_rtp_header(&audio).unwrap().payload_type,
+            peer_audio_ssrc,
+            30,
+            &[0xf8, 0xff, 0xfe, 0, 2],
+            &[],
+            true,
+        );
+        eng.handle_input(RTCP_MS + 21, Input::RelayPacket(&padded_audio));
+        let _ = drain(&mut eng);
+        eng.handle_input(1 + 2 * RTCP_MS, Input::Timeout);
+        let (outs, _) = drain(&mut eng);
+        let added_video = 4 + carried_audio.len() as u32;
+        check_report(
+            &outs,
+            local_video_ssrc,
+            101 + added_video,
+            added_video * 8000 / RTCP_MS as u32,
+        );
+        check_report(&outs, local_audio_ssrc, 9, 6 * 8000 / RTCP_MS as u32);
     }
 
     /// Bring a 1:1 engine up to the point where the peer's video stream has
@@ -10370,6 +10596,44 @@ mod tests {
         for packet in peer.protect_video(&video_delta_au(100)) {
             eng.handle_input(now, Input::RelayPacket(&packet));
         }
+    }
+
+    // Reassembly's counters reach the call's stats, so a call whose packets arrived but whose
+    // pictures did not can say where they went.
+    #[test]
+    fn video_reassembly_counters_reach_media_stats() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        // The stream is already established, with its first picture through.
+        let before = eng.media_stats();
+        assert_eq!(before.video_access_units_completed, 1);
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(200, Input::RelayPacket(&packet));
+        }
+        // A fragmented picture whose second packet is lost: the partial NAL is dropped, its later
+        // fragments are orphans, and the timestamp yields nothing.
+        let mut fragments = peer.protect_video(&video_delta_au(3_000));
+        assert!(fragments.len() > 3);
+        fragments.remove(1);
+        for packet in &fragments {
+            eng.handle_input(300, Input::RelayPacket(packet));
+        }
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(400, Input::RelayPacket(&packet));
+        }
+
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_rtp_lost, 1);
+        assert_eq!(stats.video_access_units_completed, 3);
+        assert_eq!(stats.video_fu_dropped_sequence_gap, 1);
+        assert_eq!(
+            stats.video_fu_orphan_fragments,
+            u32::try_from(fragments.len() - 1).unwrap()
+        );
+        assert_eq!(stats.video_access_units_empty, 1);
+        assert_eq!(stats.video_access_units_without_marker, 0);
+        assert_eq!(stats.video_ssrc_switches, 0);
+        let report = format!("{stats:?}");
+        assert!(report.contains("video_fu_dropped_sequence_gap: 1"));
     }
 
     #[test]
@@ -12184,6 +12448,17 @@ mod tests {
         media: &[u8],
         audio: &[u8],
     ) -> Vec<u8> {
+        peer_packet_carrying_audio_with_padding(payload_type, ssrc, seq, media, audio, false)
+    }
+
+    fn peer_packet_carrying_audio_with_padding(
+        payload_type: u8,
+        ssrc: u32,
+        seq: u16,
+        media: &[u8],
+        audio: &[u8],
+        padded: bool,
+    ) -> Vec<u8> {
         use crate::voip::e2e_srtp::{crypt_payload_in_place, derive_e2e_keys};
         use crate::voip::rtp::VIDEO_MEDIA_FRAME_INFO_IDR;
         use crate::voip::warp::append_warp_mi_tag_in_place;
@@ -12193,7 +12468,7 @@ mod tests {
         let [high, low] = u16::try_from(media.len())
             .expect("media fits")
             .to_be_bytes();
-        let mut packet = vec![0x90, 0x80 | payload_type];
+        let mut packet = vec![if padded { 0xb0 } else { 0x90 }, 0x80 | payload_type];
         packet.extend_from_slice(&seq.to_be_bytes());
         packet.extend_from_slice(&(u32::from(seq) * VIDEO_TS_STRIDE_15FPS).to_be_bytes());
         packet.extend_from_slice(&ssrc.to_be_bytes());

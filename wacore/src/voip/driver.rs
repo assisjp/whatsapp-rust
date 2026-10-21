@@ -634,28 +634,39 @@ fn pop_next_packet(
 /// pacer only spreads what it is given, and 2.5 is the factor WebRTC's paced sender uses, which
 /// drains a keyframe several times its frame interval long in a few frame intervals.
 const VIDEO_PACE_FACTOR: (u64, u64) = (5, 2);
-/// The pace before the call has a rate to go by, and the least it ever runs at, so the first
-/// keyframe of a call, the largest unit it sends, is not held back by the rate of no video at all.
-const VIDEO_PACE_FLOOR_BPS: u64 = 1_000_000;
+/// The pace before the call has a rate to go by, and the least it ever runs at. It sets how fast a
+/// keyframe's excess over the burst drains: at 4 Mbit/s a 40 KB 720p keyframe is out in about
+/// 40 ms, inside one frame interval, where 1 Mbit/s held it, and every frame queued behind it, for a
+/// few hundred. WhatsApp's own senders put a whole access unit on the wire within a fraction of a
+/// millisecond, far faster than this, so the floor asks no more of the relay path than they do.
+const VIDEO_PACE_FLOOR_BPS: u64 = 4_000_000;
 /// The window the video rate is measured over.
 const VIDEO_PACE_WINDOW_MS: engine::Millis = 1_000;
-/// How much may leave together. The drive loop's timers count whole milliseconds, so a packet may
-/// go up to this early rather than the pace collapsing to one packet per timer tick; a few
-/// milliseconds of the pacing rate is two or three packets, not a burst.
-const VIDEO_PACE_BURST_US: u64 = 5_000;
+/// How much of the pacing rate may leave at once: the burst interval of WebRTC's paced sender,
+/// whose pacing factor this pacer already uses. At 2.5 times the video rate, 40 ms of the pace is
+/// 100 ms of video, two average frames at 20 fps, so an ordinary access unit leaves as one burst,
+/// as WhatsApp's peers send it; the floor keeps it at least 20 KB. A receiver decodes a frame only
+/// once its last packet arrives, so spreading one frame's packets only delays its picture: with a
+/// 5 ms burst, frames left over about 19 ms and keyframes over 50 to 70, and an iPhone peer asked
+/// for a keyframe every 2.5 s on a clean path, against 9 a minute once frames left whole.
+const VIDEO_PACE_BURST_US: u64 = 40_000;
 
-/// Spreads outbound video over time, so an access unit reaches the relay at the pacing rate rather
-/// than as one burst of every packet it was cut into.
+/// Spreads outbound video over time once it exceeds a burst, so a keyframe larger than the burst,
+/// or a backlog of access units after a stall, reaches the relay at the pacing rate rather than at
+/// whatever rate the host can write it.
 ///
 /// A keyframe is several times the size of the frames around it, and the engine packetizes it in
 /// one call: sent back to back, its forty or more packets leave at whatever rate the host can
 /// write them, which the relay's flow (or the path behind it) can take only as loss. WhatsApp's
 /// own engine paces its video the same way (its paced sender, with a pacing rate and a pacing
 /// factor, sits between the encoder and the transport). Losing part of a keyframe costs the peer
-/// its picture until the next one arrives, which is the freeze a peer sees.
+/// its picture until the next one arrives, which is the freeze a peer sees. The burst budget is
+/// what lets an ordinary frame through whole: the pacer bounds a run of frames, not the packets of
+/// one.
 ///
 /// The pace follows the rate the call's video has actually been sent at, so it needs nothing from
-/// the application: a smaller picture paces slower, a larger one faster.
+/// the application: a smaller picture paces slower, a larger one faster, and the burst, a span of
+/// that pace, grows with the frames.
 #[derive(Default)]
 struct VideoPacer {
     /// Video packets sent within the last window, as (when, bytes).
@@ -3491,8 +3502,11 @@ mod tests {
         let mut channels = test_channels(mic_rx, speaker, events);
         let (video_tx, video_rx) = async_channel::unbounded();
         channels.video_in = video_rx;
+        // A 30 KB IDR slice: 32 fragments, past the 20 KB burst the pacer lets out at once, so
+        // the rest waits on the pacer's deadlines.
+        const FRAGMENTS: usize = 32;
         let mut au = vec![0, 0, 0, 1, 0x65];
-        au.extend(vec![0x55; 3000]);
+        au.extend(vec![0x55; 30_000]);
         video_tx.try_send(au).unwrap();
         let engine = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         let clock = rt.clock.clone();
@@ -3516,7 +3530,7 @@ mod tests {
                     parse_rtp_header(p).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
                 })
                 .count();
-            if count == 5 {
+            if count == FRAGMENTS + 1 {
                 break;
             }
             let at = *rt
@@ -3539,19 +3553,27 @@ mod tests {
             })
             .cloned()
             .collect();
-        assert_eq!(video.len(), 5, "four new fragments and one retransmission");
         assert_eq!(
-            video[1].1, video[4].1,
+            video.len(),
+            FRAGMENTS + 1,
+            "every new fragment and one retransmission"
+        );
+        assert_eq!(
+            video[1].1, video[FRAGMENTS].1,
             "retransmit the original protected fragment"
         );
-        // At this small volume the 1 Mbit/s floor applies: each byte costs 8 us,
-        // with a 5 ms burst allowance. Check dispatch times, not only packet count.
+        // At this small volume the 4 Mbit/s floor applies: each byte costs 2 us,
+        // with a 40 ms burst allowance. Check dispatch times, not only packet count.
         let mut next_us = 0u64;
         for (at, packet) in &video {
-            let expected = next_us.saturating_sub(5000).div_ceil(1000);
+            let expected = next_us.saturating_sub(40_000).div_ceil(1000);
             assert_eq!(*at, expected);
-            next_us = next_us.max(at * 1000) + packet.len() as u64 * 8;
+            next_us = next_us.max(at * 1000) + packet.len() as u64 * 2;
         }
+        assert!(
+            video.last().unwrap().0 > 0,
+            "the pacer held the fragments past the burst"
+        );
         relay_tx.close();
         assert!(drive.as_mut().poll(&mut context).is_ready());
         assert!(
@@ -3637,27 +3659,71 @@ mod tests {
         sent
     }
 
+    /// Bytes [`VIDEO_PACE_BURST_US`] of the pace lets out together at `rate_bps`.
+    fn burst_bytes(rate_bps: u64) -> u64 {
+        rate_bps * VIDEO_PACE_BURST_US / 8_000_000
+    }
+
     #[test]
-    fn a_keyframe_leaves_at_the_pacing_rate_rather_than_in_one_burst() {
-        // Forty-five 830-byte packets: a 37 KB keyframe, the size of a 720p one.
-        let packets = (0..45).map(|_| Bytes::from(vec![0x90; 830])).collect();
+    fn an_ordinary_access_unit_leaves_in_one_burst() {
+        // Six 960-byte packets: a 5.8 KB delta frame, the size of a 720p one at 700 kbit/s.
+        let packets = (0..6).map(|_| Bytes::from(vec![0x90; 960])).collect();
+        let mut queue = VecDeque::from([SendBatch::video(packets)]);
+        let mut pacer = VideoPacer::default();
+
+        let sent = drain_paced(&mut queue, &mut pacer, 10_000);
+
+        assert_eq!(sent.len(), 6);
+        assert!(
+            sent.iter().all(|(at, _)| *at == 10_000),
+            "every packet of the frame leaves at once: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_past_the_burst_drains_at_the_pacing_rate() {
+        // Forty-five 960-byte packets: a 43 KB keyframe, the size of a 720p one.
+        let packets = (0..45).map(|_| Bytes::from(vec![0x90; 960])).collect();
         let mut queue = VecDeque::from([SendBatch::video(packets)]);
         let mut pacer = VideoPacer::default();
 
         let sent = drain_paced(&mut queue, &mut pacer, 10_000);
 
         assert_eq!(sent.len(), 45);
-        // Nothing has been sent yet, so the floor sets the pace: 830 bytes every 6.64 ms at 1 Mbit/s,
-        // less the few milliseconds a packet may leave early.
+        // Nothing has been sent yet, so the floor sets the pace: 960 bytes every 1.92 ms at
+        // 4 Mbit/s. The burst's 20 KB, 21 packets, leave together; the other 24 follow at the pace.
+        let together = sent.iter().filter(|(at, _)| *at == sent[0].0).count();
+        assert_eq!(together, 21, "the burst budget leaves at once");
         let span = sent.last().unwrap().0 - sent[0].0;
         assert!(
-            (280..=300).contains(&span),
-            "45 packets at 1 Mbit/s take about 300 ms; took {span} ms"
+            (44..=48).contains(&span),
+            "24 packets past the burst at 4 Mbit/s take about 46 ms; took {span} ms"
         );
-        let same_instant = sent.iter().filter(|(at, _)| *at == sent[0].0).count();
+    }
+
+    #[test]
+    fn a_backlog_of_access_units_never_outruns_the_pace() {
+        // Ten 10 KB frames queued at once, as after a stalled send: far past one burst.
+        let frame = || SendBatch::video((0..10).map(|_| Bytes::from(vec![0x90; 1000])).collect());
+        let mut queue: VecDeque<_> = (0..10).map(|_| frame()).collect();
+        let mut pacer = VideoPacer::default();
+
+        let sent = drain_paced(&mut queue, &mut pacer, 10_000);
+
+        assert_eq!(sent.len(), 100);
+        let budget = burst_bytes(VIDEO_PACE_FLOOR_BPS);
+        for (n, (at, _)) in sent.iter().enumerate() {
+            let bytes = (n as u64 + 1) * 1000;
+            let allowed = budget + VIDEO_PACE_FLOOR_BPS * (at - 10_000) / 8_000 + 1000;
+            assert!(
+                bytes <= allowed,
+                "{bytes} bytes out by {at} ms, past the burst plus the pace ({allowed})"
+            );
+        }
+        let span = sent.last().unwrap().0 - sent[0].0;
         assert!(
-            same_instant <= 2,
-            "only the burst allowance may leave together; {same_instant} did"
+            (158..=162).contains(&span),
+            "80 KB past the burst at 4 Mbit/s take 160 ms; took {span} ms"
         );
     }
 
@@ -3680,14 +3746,19 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_pacer_saves_no_credit_for_a_burst() {
+    fn an_idle_pacer_saves_no_credit_beyond_one_burst() {
+        let budget = burst_bytes(VIDEO_PACE_FLOOR_BPS) as usize;
         let mut pacer = VideoPacer::default();
-        pacer.sent(0, 830);
-        assert!(!pacer.ready(0), "the next packet waits for the pace");
-        // Ten seconds of silence do not let the next keyframe out all at once.
+        pacer.sent(0, budget);
+        pacer.sent(0, 960);
+        assert!(
+            !pacer.ready(0),
+            "past the burst, the next packet waits for the pace"
+        );
+        // Ten seconds of silence refill one burst, not ten seconds' worth.
         assert!(pacer.ready(10_000));
-        pacer.sent(10_000, 830);
-        pacer.sent(10_000, 830);
+        pacer.sent(10_000, budget);
+        pacer.sent(10_000, 960);
         assert!(!pacer.ready(10_000));
         assert!(pacer.ready_at() > 10_000);
     }

@@ -7,7 +7,10 @@ use super::e2e_srtp::{
     crypt_payload_in_place, derive_e2e_keys, derive_e2e_keys_from_raw, derive_srtcp_keys,
     derive_srtcp_keys_from_raw, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
-use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
+use super::h264::{
+    H264_MAX_AU_BYTES, H264Depacketizer, H264DepacketizerStats, PacketizedAu, au_has_idr,
+    packetize_au,
+};
 use super::rtcp::{
     RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN,
     build_whatsapp_picture_loss_indication, build_whatsapp_rtcp_cname,
@@ -710,8 +713,27 @@ fn unprotect_srtp_packet_checked(
 /// reassembled from them on receive.
 type TimestampedAccessUnit = (u32, Vec<u8>, Option<u8>);
 type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
-/// [`VideoPacketResult`] plus the audio packet the video packet carried piggybacked, if any.
-type VideoPacketSplit = (RtpHeader, Vec<TimestampedAccessUnit>, Option<Vec<u8>>);
+/// [`VideoPacketResult`], embedded audio if present, and authenticated payload bytes without padding.
+type VideoPacketSplit = (
+    RtpHeader,
+    Vec<TimestampedAccessUnit>,
+    Option<Vec<u8>>,
+    usize,
+);
+
+/// What inbound reassembly did with authenticated video packets since the last
+/// [`VideoPipeline::take_reassembly_stats`]: the depacketizer's own counters plus the stream
+/// changes that happen before a packet reaches it. Counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoReassemblyStats {
+    pub depacketizer: H264DepacketizerStats,
+    /// Times reassembly moved from one peer SSRC to another. The first stream is not a switch.
+    pub ssrc_switches: u32,
+    /// Those switches that discarded a partial access unit the previous stream left behind.
+    pub ssrc_switch_partial_dropped: u32,
+    /// Packets from a retired SSRC ignored for their picture (their piggybacked audio is kept).
+    pub retired_ssrc_ignored: u32,
+}
 
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
@@ -755,6 +777,10 @@ pub struct VideoPipeline {
     packets_since_stream_change: u32,
     /// Consecutive packets from `contender_ssrc` since the last one from the stream in possession.
     retired_ssrc_run: u32,
+    /// Stream-change counters; the depacketizer keeps its own. See [`VideoReassemblyStats`].
+    ssrc_switches: u32,
+    ssrc_switch_partial_dropped: u32,
+    retired_ssrc_ignored: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -804,6 +830,9 @@ impl VideoPipeline {
             contender_ssrc: None,
             packets_since_stream_change: 0,
             retired_ssrc_run: 0,
+            ssrc_switches: 0,
+            ssrc_switch_partial_dropped: 0,
+            retired_ssrc_ignored: 0,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -944,6 +973,17 @@ impl VideoPipeline {
         self.retired_ssrc_run = 0;
     }
 
+    /// Hand back the reassembly counters accumulated since the previous call and start them again
+    /// from zero, so the caller can fold them into totals that outlive this pipeline.
+    pub fn take_reassembly_stats(&mut self) -> VideoReassemblyStats {
+        VideoReassemblyStats {
+            depacketizer: self.depacketizer.take_stats(),
+            ssrc_switches: std::mem::take(&mut self.ssrc_switches),
+            ssrc_switch_partial_dropped: std::mem::take(&mut self.ssrc_switch_partial_dropped),
+            retired_ssrc_ignored: std::mem::take(&mut self.retired_ssrc_ignored),
+        }
+    }
+
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
         if au.len() > H264_MAX_AU_BYTES {
@@ -1013,7 +1053,7 @@ impl VideoPipeline {
     pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
         self.unprotect_video_packet_split(packet)
             .ok()
-            .map(|(header, completed, _)| (header, completed))
+            .map(|(header, completed, _, _)| (header, completed))
     }
 
     /// [`Self::unprotect_video_packet`], also handing back the audio packet the video packet
@@ -1036,6 +1076,7 @@ impl VideoPipeline {
             self.warp_mi_tag_len,
             packet,
         )?;
+        let payload_len = super::rtp::received_payload_len(packet, &payload);
         let piggybacked_audio = super::rtp::split_whatsapp_audio_piggyback(packet, &mut payload);
         // Counted BEFORE the grace check, and for every authenticated packet including the ones that
         // check ignores. Counting only the stream that replaced the retired one would never expire
@@ -1075,12 +1116,18 @@ impl VideoPipeline {
                 if self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
                     || self.retired_ssrc_run < RETIRED_SSRC_RESUME_PACKETS
                 {
+                    self.retired_ssrc_ignored = self.retired_ssrc_ignored.saturating_add(1);
                     // Its picture is ignored, but the audio it carries is the peer's current
                     // audio: the audio stream does not change with the video SSRC.
-                    return Ok((header, Vec::new(), piggybacked_audio));
+                    return Ok((header, Vec::new(), piggybacked_audio, payload_len));
                 }
             }
             if self.depacketizer_ssrc.is_some() {
+                self.ssrc_switches = self.ssrc_switches.saturating_add(1);
+                if self.depacketizer.holds_partial() {
+                    self.ssrc_switch_partial_dropped =
+                        self.ssrc_switch_partial_dropped.saturating_add(1);
+                }
                 self.depacketizer.reset();
                 self.frame_orientation = None;
             }
@@ -1098,23 +1145,28 @@ impl VideoPipeline {
             self.retired_ssrc_run = 0;
             self.contender_ssrc = None;
         }
-        let previous = self.frame_orientation;
-        let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
-        match self.frame_orientation {
-            Some((timestamp, ref mut orientation)) if timestamp == header.timestamp => {
-                if rotation.is_some() {
-                    *orientation = rotation;
-                }
-            }
-            Some((timestamp, _)) if (header.timestamp.wrapping_sub(timestamp) as i32) <= 0 => {}
-            _ => self.frame_orientation = Some((header.timestamp, rotation)),
-        }
-        let first = self.depacketizer.push(
+        let first = self.depacketizer.push_with_time_offset(
             header.sequence_number,
             header.timestamp,
+            super::rtp::parse_whatsapp_media_time_offset(packet),
             &payload,
             header.marker,
         );
+        // Keyed by the timestamp the depacketizer hands the picture out with, which is not the RTP
+        // timestamp for a picture sharing its predecessor's.
+        let previous = self.frame_orientation;
+        if let Some(picture) = self.depacketizer.last_packet_timestamp() {
+            let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
+            match self.frame_orientation {
+                Some((timestamp, ref mut orientation)) if timestamp == picture => {
+                    if rotation.is_some() {
+                        *orientation = rotation;
+                    }
+                }
+                Some((timestamp, _)) if (picture.wrapping_sub(timestamp) as i32) <= 0 => {}
+                _ => self.frame_orientation = Some((picture, rotation)),
+            }
+        }
         let mut completed = Vec::with_capacity(if first.is_some() { 2 } else { 0 });
         // Ready AUs are drained after every push, so at most the previous unmarked
         // AU and the current AU complete here. Keep each one's own orientation.
@@ -1128,7 +1180,7 @@ impl VideoPipeline {
             completed.push((timestamp, au, orientation));
             next = self.depacketizer.pop_ready();
         }
-        Ok((header, completed, piggybacked_audio))
+        Ok((header, completed, piggybacked_audio, payload_len))
     }
 }
 
@@ -1926,6 +1978,35 @@ mod tests {
         );
     }
 
+    // A picture an iPhone sent on its predecessor's RTP timestamp, told apart by a media time
+    // offset one frame interval later: reassembled as its own access unit, with its own rotation.
+    #[test]
+    fn picture_on_a_shared_timestamp_keeps_its_own_timestamp_and_rotation() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        let mut send = |info: u8, offset: i16, timestamp: u32| {
+            let mut header = tx.rtp.next_video_packet(true, info);
+            header.timestamp = timestamp;
+            if let Some(extension) = header.video_extension.as_mut() {
+                extension.short_offset = offset;
+            }
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            rx.unprotect_video_packet(&packet).unwrap().1
+        };
+        let au = vec![0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(send(1, 12, 9000), vec![(9000, au.clone(), Some(1))]);
+        assert_eq!(
+            send(2, 79, 9000),
+            vec![(9000 + 67 * 90, au.clone(), Some(2))],
+            "the second picture is neither discarded nor given the first one's rotation"
+        );
+        assert_eq!(send(3, 12, 21_000), vec![(21_000, au, Some(3))]);
+    }
+
     #[test]
     fn frame_orientation_preserves_presence_across_fragments_and_rejects_forgery() {
         let key = [42u8; 32];
@@ -2183,6 +2264,69 @@ mod tests {
             Some(vec![au]),
             "the new stream's access unit must survive the overlap intact"
         );
+    }
+
+    // Every way a stream change costs a picture is counted: the switch, the partial access unit it
+    // discards, and the stragglers from the stream it left.
+    #[test]
+    fn reassembly_counts_stream_switches_and_ignored_stragglers() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut old = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut new = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        // The first stream to arrive is not a switch.
+        let au = video_au(60);
+        let packet = old.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+        let first = rx.take_reassembly_stats();
+        assert_eq!(first.ssrc_switches, 0);
+        assert_eq!(first.depacketizer.access_units_completed, 1);
+
+        // The old stream is part-way through an access unit when the new one takes over.
+        let fragments = old.protect_video(&video_au(4_000));
+        assert!(fragments.len() > 2);
+        assert_eq!(rx.unprotect_video(&fragments[0]), None);
+        let au = video_au(60);
+        let packet = new.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+        // The rest of the old access unit arrives late and is ignored.
+        for fragment in &fragments[1..] {
+            assert_eq!(rx.unprotect_video(fragment), None);
+        }
+
+        let stats = rx.take_reassembly_stats();
+        assert_eq!(stats.ssrc_switches, 1);
+        assert_eq!(stats.ssrc_switch_partial_dropped, 1);
+        assert_eq!(
+            stats.retired_ssrc_ignored,
+            u32::try_from(fragments.len() - 1).unwrap()
+        );
+        assert_eq!(stats.depacketizer.access_units_completed, 1);
+        assert_eq!(
+            rx.take_reassembly_stats(),
+            VideoReassemblyStats::default(),
+            "taking the counters starts them again from zero"
+        );
+
+        // A switch with nothing half-assembled discards nothing.
+        let au = video_au(60);
+        let mut third = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x00FF_00FF;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let packet = third.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+        let stats = rx.take_reassembly_stats();
+        assert_eq!(stats.ssrc_switches, 1);
+        assert_eq!(stats.ssrc_switch_partial_dropped, 0);
     }
 
     // The grace has to end even when nothing but the retired stream arrives. A peer that sends one
